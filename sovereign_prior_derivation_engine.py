@@ -766,9 +766,15 @@ def _derive_slot6_ema_ribbon(
         audit["slot_6_ema_ribbon_spans"] = {"value": fallback_spans, "method": "fallback", "error": str(exc)}
 
     try:
-        dw = max(int(dominant_cycle // 24), const["one_int"])
+        divisor = const["cycle_window_divisor"]
+        min_win = const["min_window_slot_06"] if const.get("enable_short_cycle_guard", True) else const["one_int"]
+        dw = max(int(dominant_cycle // divisor), min_win)
         priors["slot_6_divergence_window"] = dw
-        audit["slot_6_divergence_window"] = {"value": dw, "method": "dominant_cycle_div_24"}
+        audit["slot_6_divergence_window"] = {
+            "value": dw,
+            "method": "dominant_cycle_div_cycle_window_divisor",
+            "divisor_used": divisor
+        }
     except Exception as exc:
         priors["slot_6_divergence_window"] = fallback_dw
         audit["slot_6_divergence_window"] = {"value": fallback_dw, "method": "fallback", "error": str(exc)}
@@ -1132,9 +1138,15 @@ def _derive_slot12_microprice(
 
     # rolling_window
     try:
-        rw = max(int(dominant_cycle // 24), const["one_int"])
+        divisor = const["cycle_window_divisor"]
+        min_win = const["min_window_slot_12"] if const.get("enable_short_cycle_guard", True) else const["one_int"]
+        rw = max(int(dominant_cycle // divisor), min_win)
         priors["slot_12_rolling_window"] = rw
-        audit["slot_12_rolling_window"] = {"value": rw, "method": "dominant_cycle_div_24"}
+        audit["slot_12_rolling_window"] = {
+            "value": rw,
+            "method": "dominant_cycle_div_cycle_window_divisor",
+            "divisor_used": divisor
+        }
     except Exception as exc:
         priors["slot_12_rolling_window"] = fallback_rw
         audit["slot_12_rolling_window"] = {"value": fallback_rw, "method": "fallback", "error": str(exc)}

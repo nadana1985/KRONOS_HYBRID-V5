@@ -186,6 +186,11 @@ reproducibility:
     ms_factor_int: 1000
     max_timestamp_hash: 4294967295
     default_normalisation_window: 288
+    # Cycle scaling priors (explicit)
+    cycle_window_divisor: 24
+    min_window_slot_06: 5
+    min_window_slot_12: 5
+    enable_short_cycle_guard: true
     five_float: 5.0
     ten_float: 10.0
     thirty_int: 30
