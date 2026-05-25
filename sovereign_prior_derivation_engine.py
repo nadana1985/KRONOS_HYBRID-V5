@@ -138,6 +138,12 @@ def derive_sovereign_priors(
         }
 
     const = config["reproducibility"]["constants"]
+    global _MIN_BARS_FOR_CWT, _MIN_BARS_FOR_BIC, _MIN_BARS_FOR_ACF, _MATH_HALF
+    _MIN_BARS_FOR_CWT = int(const["min_bars_for_cwt"])
+    _MIN_BARS_FOR_BIC = int(const["min_bars_for_bic"])
+    _MIN_BARS_FOR_ACF = int(const["min_bars_for_acf"])
+    _MATH_HALF = float(const["math_half"])
+
     epsilon = const["epsilon"]
     zero_f = const["zero_float"]
     one_f = const["one_float"]

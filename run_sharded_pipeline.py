@@ -53,7 +53,7 @@ def _run_shard(shard_start: str, shard_end: str, base_config: dict) -> None:
     Sovereign Prior Derivation (when sovereign_derivation.enabled=true):
       After data ingestion, the full causal OHLCV shard is passed to
       sovereign_prior_derivation_engine.derive_sovereign_priors() which
-      derives all 47 priors empirically and patches them back into config
+      derives all derived priors empirically and patches them back into config
       before the bar-by-bar mining loop runs. This ensures every shard
       mines with priors adapted to the market structure visible up to that
       shard — not static researcher estimates.

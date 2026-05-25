@@ -152,6 +152,10 @@ reproducibility:
   precision: "float16"
   enforce_pinning: true
   constants:
+    min_bars_for_cwt: 64
+    min_bars_for_bic: 128
+    min_bars_for_acf: 50
+    math_half: 0.5
     z_clip_default: 10.0
     max_wick_ratio: 100.0
     gpf_sentinel: 999.0
@@ -285,6 +289,8 @@ validator:
     - 'lightning_ai_launch_guide'
     - '__pycache__'
     - '.git'
+    - 'quant_prior_audit.md'
+    - 'sovereign_prior_derivation_engine.py'
   severity_rules:
     default: "CRITICAL"
   exit_violations: 1
