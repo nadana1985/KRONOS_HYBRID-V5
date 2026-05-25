@@ -124,8 +124,8 @@ data:
   raw_aggtrades_path: null
   processed_path: "data/processed/ethusdt_5m_features_truth_extended.parquet"
   enable_incremental_fetch: true
-  fetch_start_date: "2019-11-27 08:00:00"
-  fetch_end_date: null                     # null = auto yesterday (experimental)
+  fetch_start_date: "2026-05-01 00:00:00"
+  fetch_end_date: "2026-05-20 00:00:00"                     # short recent test window
   binance_api_url: "https://fapi.binance.com/fapi/v1/klines"
   binance:
     limit_per_request: 1000

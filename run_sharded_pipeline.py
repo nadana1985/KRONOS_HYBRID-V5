@@ -135,6 +135,7 @@ def _mine_shard_only(config: dict) -> None:
     import data_engine
     import feature_builder_engine
     import numpy as np
+    import time
 
     const = config["reproducibility"]["constants"]
     one_i = const["one_int"]
@@ -166,8 +167,16 @@ def _mine_shard_only(config: dict) -> None:
             precomputed_vol_forecast = log_ret_shard.rolling(vol_lb).std().diff().fillna(zero_f)
 
             shard_detected = []
+            
+            bar_indices = list(miner_engine.bar_index_range(shard_candles, config, skip_warmup=is_first_shard))
+            total_bars = len(bar_indices)
+            
+            start_time = time.time()
+            last_print_time = start_time
+            
+            print(f"  -> Starting walk-forward loop on {total_bars} bars for {symbol}...", flush=True)
 
-            for current_idx in miner_engine.bar_index_range(shard_candles, config, skip_warmup=is_first_shard):
+            for step_idx, current_idx in enumerate(bar_indices, 1):
                 dna_row = feature_builder_engine.build_full_dna_vector(
                     shard_candles, shard_trades, current_idx, recent_convictions, config,
                     precomputed_structural_df=precomputed_structural_df,
@@ -190,17 +199,34 @@ def _mine_shard_only(config: dict) -> None:
                 recent_convictions = feature_builder_engine.update_conviction_buffer(
                     recent_convictions, dna_row, config
                 )
+                
+                # Periodic step logging for background task log visibility
+                current_time = time.time()
+                if step_idx % const["hundred_int"] == const["zero_int"] or step_idx == const["one_int"] or step_idx == total_bars or (current_time - last_print_time) > float(const["thirty_int"]):
+                    elapsed = current_time - start_time
+                    latency_per_bar = elapsed / step_idx
+                    pct = (step_idx / total_bars) * float(const["hundred_int"])
+                    mined = len(shard_detected)
+                    print(
+                        f"[PROGRESS] {symbol} | Bar {step_idx}/{total_bars} ({pct:.2f}%) | "
+                        f"Mined: {mined} | Elapsed: {elapsed:.1f}s | "
+                        f"Speed: {latency_per_bar:.4f}s/bar | "
+                        f"Candle: {shard_candles['datetime'].iloc[current_idx]}",
+                        flush=True
+                    )
+                    last_print_time = current_time
 
             # Batch write at end of shard
             mined_count = len(shard_detected)
             total_eval = len(shard_candles)
             discarded = total_eval - mined_count
-            print(f"  -> [SHARD STATS] Bars Evaluated: {total_eval:,} | Signatures Mined: {mined_count:,} | Discarded: {discarded:,} ({discarded/total_eval:.2%})")
+            print(f"  -> [SHARD STATS] Bars Evaluated: {total_eval:,} | Signatures Mined: {mined_count:,} | Discarded: {discarded:,} ({discarded/total_eval:.2%})", flush=True)
             
             if shard_detected:
                 database_engine.store_signatures_batch(shard_detected, config)
 
             is_first_shard = False
+
 
 
 def main():
