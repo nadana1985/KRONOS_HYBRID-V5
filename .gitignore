@@ -1,6 +1,4 @@
-# KRONOS Sovereign .gitignore — ZERO inline literals where avoidable
-
-# Runtime data (dynamic from cfg["data"] / cfg["database"])
+# KRONOS V5 Sovereign .gitignore
 data/
 *.parquet
 *.duckdb
@@ -8,34 +6,17 @@ data/
 *.log
 shard_checkpoint.json
 signatures_compact.parquet
-
-# Models & caches (pinned via SHA256 in params_yaml.txt)
 kronos_module/models/
 __pycache__/
 *.pt
 *.bin
 .cache/
 .lightning/
-
-# Artifacts
 artifacts/
 backups/
 logs/
-
-# Env & secrets
 .env
 *.env
 .DS_Store
 *.swp
-
-# Temporary scratch (allowed in workflow but ignored)
 scratch/*.tmp
-scratch/*.bak
-
-# Large binaries
-*.h5
-*.onnx
-
-# Exclude validator noise
-compliance_audit/
-mathematical_conflict_report/
