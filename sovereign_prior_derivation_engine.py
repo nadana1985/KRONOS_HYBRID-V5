@@ -767,17 +767,20 @@ def _derive_slot6_ema_ribbon(
 
     try:
         divisor = const["cycle_window_divisor"]
-        min_win = const["min_window_slot_06"] if const.get("enable_short_cycle_guard", True) else const["one_int"]
-        dw = max(int(dominant_cycle // divisor), min_win)
+        min_win = const["min_window_slot_06"] if const.get("enable_short_cycle_guard", True) else 1
+        
+        raw_dw = int(dominant_cycle // divisor)
+        dw = max(raw_dw, min_win)
+        
         priors["slot_6_divergence_window"] = dw
         audit["slot_6_divergence_window"] = {
-            "value": dw,
-            "method": "dominant_cycle_div_cycle_window_divisor",
-            "divisor_used": divisor
+            "value": dw, 
+            "method": "dominant_cycle_div_configured_divisor",
+            "divisor": divisor
         }
     except Exception as exc:
-        priors["slot_6_divergence_window"] = fallback_dw
-        audit["slot_6_divergence_window"] = {"value": fallback_dw, "method": "fallback", "error": str(exc)}
+        priors["slot_6_divergence_window"] = 5
+        audit["slot_6_divergence_window"] = {"value": 5, "method": "fallback"}
 
 
 def _derive_slot7_vol_price_div(
@@ -1139,17 +1142,20 @@ def _derive_slot12_microprice(
     # rolling_window
     try:
         divisor = const["cycle_window_divisor"]
-        min_win = const["min_window_slot_12"] if const.get("enable_short_cycle_guard", True) else const["one_int"]
-        rw = max(int(dominant_cycle // divisor), min_win)
+        min_win = const["min_window_slot_12"] if const.get("enable_short_cycle_guard", True) else 1
+        
+        raw_rw = int(dominant_cycle // divisor)
+        rw = max(raw_rw, min_win)
+        
         priors["slot_12_rolling_window"] = rw
         audit["slot_12_rolling_window"] = {
-            "value": rw,
-            "method": "dominant_cycle_div_cycle_window_divisor",
-            "divisor_used": divisor
+            "value": rw, 
+            "method": "dominant_cycle_div_configured_divisor",
+            "divisor": divisor
         }
     except Exception as exc:
-        priors["slot_12_rolling_window"] = fallback_rw
-        audit["slot_12_rolling_window"] = {"value": fallback_rw, "method": "fallback", "error": str(exc)}
+        priors["slot_12_rolling_window"] = 5
+        audit["slot_12_rolling_window"] = {"value": 5, "method": "fallback"}
 
 
 def _derive_slot13_shannon(
