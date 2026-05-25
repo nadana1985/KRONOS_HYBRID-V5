@@ -1,0 +1,359 @@
+# KRONOS V5 Hybrid Sovereign Engine — params_yaml.txt
+# ==============================================================================
+# SINGLE SOURCE OF TRUTH. All runtime values live here.
+# Code and specs MUST resolve exclusively via cfg["section"]["key"].
+# ZERO inline literals permitted anywhere else.
+
+feature_builder:
+  stride: 1
+  batch_size: 512
+  use_gpu: true
+  interval: "5m"
+  precision: "float16"
+  amp_enabled: true
+
+  structural:
+    z_clip_default: 10.0
+    max_wick_ratio: 100.0
+    veto_threshold: 0.0
+    slot_order: ["slot_0", "slot_1", "slot_2", "slot_3", "slot_4", "slot_5", "slot_6", "slot_7", "slot_8", "slot_9", "slot_10", "slot_11", "slot_12", "slot_13", "slot_14"]
+
+    slot_0: {type: "bid_ask_absorb", lookback_bars: 24, volume_percentile: 90, decay_factor: 0.95, extreme_threshold: 0.05, key_name: "slot_00"}
+    slot_1: {type: "vpin", volume_bucket_size: 50, lookback_buckets: 100, decay_factor: 0.98, key_name: "slot_01"}
+    slot_2: {type: "spectral_entropy", lookback_bars: 72, use_log_returns: true, key_name: "slot_02"}
+    slot_3: {type: "log_var_ratio", short_window: 12, long_window: 144, key_name: "slot_03"}
+    slot_4: {type: "fractal_hurst", lookback_bars: 120, grid_points: 50, key_name: "slot_04"}
+    slot_5: {type: "autocorr_multillag", lookback_bars: 48, lags: [1, 2, 3, 4, 5], key_name: "slot_05"}
+    slot_6: {type: "ema_ribbon_deviation", ema_ribbon_spans: [8, 13, 21, 34, 55], divergence_window: 12, key_name: "slot_06"}
+    slot_7: {type: "volume_price_divergence", lookback_bars: 24, acceleration_lag: 3, key_name: "slot_07"}
+    slot_8: {type: "hmm_regime", num_regimes: 4, target_regime_index: 3, lookback_bars: 288, hmm_n_iter: 100, hmm_refit_interval: 288, features: ["volatility", "returns", "vpin"], key_name: "slot_08"}
+    slot_9: {type: "liquidity_vacuum", depth_levels: 5, imbalance_threshold: 0.85, key_name: "slot_09"}
+    slot_10: {type: "wick_ratio", lookback_bars: 1, body_threshold: 0.15, normalisation_window: 288, quantile_threshold: 0.99, key_name: "slot_10"}
+    slot_11: {type: "sr_kde_proximity", pivot_lookback: 144, pivot_strength: 3, bandwidth: 0.005, key_name: "slot_11"}
+    slot_12: {type: "microprice_deviation", imbalance_coefficient: 0.65, rolling_window: 12, key_name: "slot_12"}
+    slot_13: {type: "shannon_entropy", lookback_bars: 96, num_bins: 10, key_name: "slot_13"}
+    slot_14: {type: "hilbert_cycle", lookback_bars: 200, key_name: "slot_14"}
+
+    slot_15:
+      weights:
+        slot_00: 0.08
+        slot_01: 0.08
+        slot_02: 0.08
+        slot_03: 0.06
+        slot_04: 0.08
+        slot_05: 0.05
+        slot_06: 0.08
+        slot_07: 0.06
+        slot_08: 0.10
+        slot_09: 0.07
+        slot_10: 0.05
+        slot_11: 0.08
+        slot_12: 0.05
+        slot_13: 0.04
+        slot_14: 0.04
+      per_slot_normalisation:
+        slot_00: {low: -1.0, high: 1.0}
+        slot_03: {low: -5.0, high: 5.0}
+        slot_04: {low: 0.0, high: 1.0}
+        slot_07: {low: -10.0, high: 10.0}
+        slot_12: {low: -5.0, high: 5.0}
+      key_name: "slot_15"
+
+  gate:
+    conviction_multiplier: 1.1
+    recent_conviction_window: 1000
+    conviction_time_window_days: 7
+    conviction_vol_multiplier: 1.0
+    baseline_vol: 0.0035
+    conviction_vol_clip_low: 0.3
+    conviction_vol_clip_high: 3.0
+    norm_order: 2
+    min_conviction_floor: 0.05
+    structural_veto_slot_key: "slot_15"
+    signature_flag_key: "signature_flag"
+    neural_conviction_key: "neural_conviction"
+    conviction_threshold_key: "conviction_threshold"
+
+  aux:
+    vol_forecast: {weight: 0.3, lookback_bars: 48, key_name: "slot_24"}
+    mfe_projection: {samples: 100, horizon_bars: 72, key_name: "slot_25"}
+    neural_regime: {latent_states: 8, key_name: "slot_26"}
+    residual: {distance_metric: "l2", key_name: "slot_27"}
+
+  metadata:
+    index_cols: ["timestamp", "symbol", "interval"]
+    phylum_clustering_method: "hdbscan"
+    quality_score_formula: "weighted_composite"
+    hdbscan: {min_cluster_size: 15, min_samples: 5, metric: "euclidean", n_jobs: -1}
+    keys:
+      phylum_id: "slot_28"
+      timestamp_hash: "slot_29"
+      recovery_proxy: "slot_30"
+      signature_quality: "slot_31"
+
+kronos_mini:
+  model_name: "kronos_module/models/kronos_small"
+  tokenizer_name: "kronos_module/models/kronos_tokenizer"
+  context_length: 2048
+  embedding_dim: 8
+  slot_key_prefix: "slot_"
+  slot_start_idx: 16
+  model_sha256: "13c23c3147465970e4f8f06c362ad7816d949528d64cbd90f7487eb5c9ce7196"
+  tokenizer_sha256: "1906fc70d44dbe7b3f152fb94af4b086b753d4ffed1ea143dc54462b43d9c4a6"
+  pooling:
+    method: "volatility_gated_exp_decay"
+    decay_factor: 0.95
+    vol_threshold_percentile: 75
+  # FLAW 13 FIX: long-term reference window for global volatility anchor.
+  # Prevents local micro-structure from distorting the vol-gate threshold.
+  global_vol_ref_bars: 10000
+
+data:
+  source: "binance_free"
+  symbols: ["ETHUSDT"]
+  intervals: ["5m"]
+  use_trades: true
+  volume_classification_method: "bvc"
+  bvc:
+    std_window: 20
+    scaling_factor: 1.5
+    min_periods: 1
+    sigmoid_k: 1.5
+    z_clip: 10.0
+  raw_ohlcv_path: "data/raw/ethusdt_5m_extension_ohlcv.parquet"
+  raw_aggtrades_path: null
+  processed_path: "data/processed/ethusdt_5m_features_truth_extended.parquet"
+  enable_incremental_fetch: true
+  fetch_start_date: "2019-11-27 08:00:00"
+  fetch_end_date: null                     # null = auto yesterday (experimental)
+  binance_api_url: "https://fapi.binance.com/fapi/v1/klines"
+  binance:
+    limit_per_request: 1000
+    sleep_time_f: 0.5
+  cache_path: "data/cache"
+  warmup_bars: 500
+  ohlcv_columns:
+    timestamp: "timestamp"
+    open: "open"
+    high: "high"
+    low: "low"
+    close: "close"
+    volume: "volume"
+  agg_trades_columns:
+    timestamp: "timestamp"
+    price: "price"
+    buy_vol: "buy_vol"
+    sell_vol: "sell_vol"
+    volume: "volume"
+
+
+reproducibility:
+  random_seed: 42
+  precision: "float16"
+  enforce_pinning: true
+  constants:
+    z_clip_default: 10.0
+    max_wick_ratio: 100.0
+    gpf_sentinel: 999.0
+    vol_baseline_default: 0.0035
+    finite_check_enabled: true
+    zero_float: 0.0
+    one_float: 1.0
+    half_float: 0.5
+    epsilon: 1.0e-12
+    zero_int: 0
+    one_int: 1
+    two_int: 2
+    three_int: 3
+    five_int: 5
+    seven_int: 7
+    eight_int: 8
+    ten_int: 10
+    fifteen_int: 15
+    sixteen_int: 16
+    one_day_int: 1
+    twenty_three_int: 23
+    twenty_four_int: 24
+    twenty_seven_int: 27
+    twenty_eight_int: 28
+    thirty_one_int: 31
+    thirty_two_int: 32
+    binance_limit_int: 1000
+    ms_factor_int: 1000
+    max_timestamp_hash: 4294967295
+    default_normalisation_window: 288
+    five_float: 5.0
+    ten_float: 10.0
+    thirty_int: 30
+    sixty_int: 60
+    hundred_int: 100
+    five_hundred_int: 500
+    vram_denominator: 1073741824
+    noise_label: -1.0
+    minutes_per_day: 1440
+    rate_limit_status: 429
+    fifty_int: 50
+    global_vol_ref_bars: 10000
+    context_length: 2048
+    hmm_n_iter: 100
+
+targets:
+  min_gross_profit: 9.5
+  min_recovery: 12.0
+  regime_id: 3
+  recovery_cap: 50.0
+  # FLAW 9 FIX: sentinel value returned as GPF when gross_loss is exactly zero.
+  # A perfect zero-loss run deserves a maximum score, not a failing 0.0.
+  perfect_gpf_sentinel: 999.0
+
+database:
+  backend: "duckdb"
+  duckdb_enabled: true
+  fallback_to_pandas: true
+  path: "data/signatures"
+  duckdb_path: "data/signatures.duckdb"
+  parquet_path_pattern: "data/signatures/**/*.parquet"
+  # FLAW 8 FIX: compact_path enables DuckDB view to prefer the consolidated file
+  compact_path: "data/signatures_compact.parquet"
+  partition_by: ["year", "month", "symbol"]
+  min_quality_score: 0.0
+  retention_policy:
+    max_age_days: 3650
+    min_recovery_factor: 8.0
+  audit:
+    git_commit_key: "git_commit"
+    data_hash_key: "data_hash"
+    config_hash_key: "config_hash"
+
+miner:
+  symbols: ["ETHUSDT"]
+  interval: "5m"
+  batch_size_days: 30
+  forward_bars: 288
+  forward_metric_mode: "post_detection"
+  max_lookahead_bars: 0
+  enable_kronos: true
+  enable_ablation: false
+  min_quality_score: 0.0
+  valid_mode_post_detection: "post_detection"
+
+validator:
+  scan_extensions: [".md", ".py"]
+  literal_patterns:
+    - '\b\d+\.\d+\b'          # floats
+    - '\b\d{2,}\b'            # integers >9
+    - '["\'][a-zA-Z0-9_.-]+/[a-zA-Z0-9_./-]+["\']' # quoted paths
+  allowlist_patterns:
+    - 'Slots? [0-9]+'
+    - '\.get\('
+    - 'return max\('
+    - '> watch'
+    - 'print'
+    - 'raise'
+    - '^.*Literal violation:.*$'
+    - 'cfg\[".*?"\]'
+    - 'config\[".*?"\]'
+    - 'load_sovereign_config'
+    - 'from .* import'
+    - 'import .*'
+    - '^\s*#.*'
+    - '^\s*//.*'
+    - 'SHA-256'
+    - 'exit_\w+'
+    - '^\|.*\|'
+    - 'Literal violation:'
+    - 'print\('
+    - 'raise \w+'
+    - 'f["\']'
+    - 'Path\('
+    - 'np\.'
+    - 'HTTP \d+'
+    - 'slot_\d+'
+    - 'SELECT '
+    - '->'
+    - 'expected_sha'
+    - '`[0-9.]+`'
+  exclude_patterns:
+    - 'kronos_module'
+    - 'inspect_evals'
+    - 'scratch'
+    - 'archive'
+    - 'walkthrough'
+    - 'compliance_audit'
+    - 'arunplacement'
+    - 'mathematical_conflict_report'
+    - 'lightning_ai_launch_guide'
+    - '__pycache__'
+    - '.git'
+  severity_rules:
+    default: "CRITICAL"
+  exit_violations: 1
+  exit_clean: 0
+  exit_usage_error: 1
+
+hardware:
+  min_ram_gb: 16
+  recommended_ram_gb: 32
+  min_vram_gb: 8
+  recommended_vram_gb: 16
+  min_storage_gb: 100
+
+backtest:
+  fold_window_days: 90
+  fold_step_days: 30
+  min_fold_bars: 1000
+  # FLAW 1 FIX: annualisation factor for Sharpe Ratio calculation (365 for crypto, 252 for equities)
+  annualisation_factor: 365
+
+deployment:
+  config_backup_path: "backups/params_yaml_snapshots"
+  backup_rotation_count: 10
+  log_path: "logs"
+  cloud_storage_target: "gs://kronos-archive"
+  sync_interval_hours: 24
+
+tokens:
+  primary_model: "openai/gpt-4o-mini"
+  fallback_models: ["anthropic/claude-3-5-haiku", "gemini/gemini-1.5-flash"]
+  temperature: 0.2
+  max_tokens: 512
+  cache_type: "disk"
+  user_role_key: "user"
+
+# ==============================================================================
+# SOVEREIGN PRIOR DERIVATION ENGINE — Policy Configuration
+# ==============================================================================
+# Controls the behaviour of sovereign_prior_derivation_engine.py.
+# All priors derived by the engine are overwritten into the relevant
+# config sections before each shard runs — config values below serve
+# as authoritative fallbacks when causal data is insufficient.
+#
+# enabled:
+#   true  → engine derives all 47 priors from causal OHLCV data each shard.
+#   false → full ablation baseline; all priors stay at params_yaml.txt values.
+#           Use this to quantify the edge added by sovereign derivation.
+#
+# frequency: "per_shard" only option currently. "per_month" throttle planned.
+#
+# bic_refit_interval_bars: BIC regime selection runs at most once per this many
+#   new causal bars. Prevents O(n×K×iter) search from dominating shard latency.
+#   Set equal to slot_8.hmm_refit_interval for consistency.
+#
+# min_improvement_threshold: reserved for future delta-gating logic.
+#   If the prior change (L2 distance) is below this, the shard re-uses the
+#   previous derivation. Currently informational only.
+#
+# store_audit: when true, writes a JSON audit file per shard to audit_path.
+#   Each file is named: {symbol}_{shard_start}_{shard_end}_sovereign_audit.json
+#
+# audit_path: directory where per-shard audit JSON files are written.
+#   Created automatically if it does not exist.
+
+sovereign_derivation:
+  enabled: true
+  method: "cwt_bic_empirical"
+  frequency: "per_shard"
+  bic_refit_interval_bars: 288
+  min_improvement_threshold: 0.03
+  store_audit: true
+  audit_path: "data/audit/sovereign_priors"
