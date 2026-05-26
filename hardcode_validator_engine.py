@@ -55,13 +55,44 @@ def _scan_file(
     allowlist: List[str],
     severity_rules: Dict
 ) -> List[Tuple[int, str, str]]:
-    """Line-by-line scanner for Python and Markdown code blocks."""
+    """Line-by-line scanner for Python and Markdown code blocks.
+    
+    For Python files, skips lines inside triple-quoted strings (docstrings and
+    multi-line string literals) — numbers appearing in documentation are not
+    sovereignty violations.
+    """
     violations = []
     content = file_path.read_text(encoding="utf-8", errors="ignore")
     suffix = file_path.suffix.lower()
 
     if suffix == ".py":
+        in_triple_quote = False
+        triple_char = None
         for line_no, line in enumerate(content.splitlines(), 1):
+            stripped = line.strip()
+            
+            # Track triple-quoted string state (docstrings, multi-line strings)
+            if not in_triple_quote:
+                # Check if a triple-quote opens on this line
+                for tq in ('"""', "'''"):
+                    if tq in stripped:
+                        # Count occurrences — odd means we're entering a block
+                        count = stripped.count(tq)
+                        if count == 1:
+                            in_triple_quote = True
+                            triple_char = tq
+                            break
+                        # count >= 2 means open+close on same line (single-line docstring)
+                        # Treat entire line as docstring — skip it
+                if in_triple_quote or any(tq in stripped and stripped.count(tq) >= 2 for tq in ('"""', "'''")):
+                    continue
+            else:
+                # Inside a triple-quoted block — check if it closes on this line
+                if triple_char and triple_char in stripped:
+                    in_triple_quote = False
+                    triple_char = None
+                continue  # skip all lines inside docstrings
+            
             if _is_allowlisted(line, allowlist):
                 continue
             for pattern in literal_patterns:

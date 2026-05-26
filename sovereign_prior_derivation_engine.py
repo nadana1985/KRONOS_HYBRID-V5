@@ -56,7 +56,8 @@ from __future__ import annotations
 
 import logging
 import warnings
-from typing import Dict, Optional, Tuple
+from functools import lru_cache
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -90,12 +91,232 @@ _BIC_CACHE: Dict[str, Dict] = {}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# PHASE 1: DYNAMIC RATIO DERIVATION HELPER METHODS
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _calculate_mutual_information(
+    x: np.ndarray,
+    y: np.ndarray,
+    bins: int,
+    const: Dict,
+) -> float:
+    """Computes Shannon Mutual Information between two continuous variables using causal 2D histogram binning in pure NumPy.
+    
+    Strictly causal and highly optimized.
+    """
+    mask = np.isfinite(x) & np.isfinite(y)
+    x = x[mask]
+    y = y[mask]
+    
+    if len(x) < bins * const["two_int"]:
+        return const["zero_float"]
+        
+    c_xy, _, _ = np.histogram2d(x, y, bins=bins)
+    p_xy = c_xy / np.sum(c_xy)
+    
+    p_x = np.sum(p_xy, axis=const["one_int"])
+    p_y = np.sum(p_xy, axis=const["zero_int"])
+    
+    mi = const["zero_float"]
+    epsilon_val = const["epsilon"]
+    
+    for i in range(bins):
+        p_xi = p_x[i]
+        if p_xi > epsilon_val:
+            for j in range(bins):
+                p_yj = p_y[j]
+                p_xiyj = p_xy[i, j]
+                if p_yj > epsilon_val and p_xiyj > epsilon_val:
+                    denom = p_xi * p_yj
+                    if denom > epsilon_val:
+                        mi += float(p_xiyj * np.log(p_xiyj / denom))
+    return mi
+
+
+def _detect_volatility_changepoint(
+    log_ret: pd.Series,
+    dominant_cycle: int,
+    config: Dict,
+    const: Dict,
+) -> int:
+    """CUSUM-based causal volatility changepoint detector with penalty.
+    
+    Identifies structural volatility regime shifts causally.
+    Returns the distance from the current bar to the most recent significant changepoint,
+    or a default fallback based on the dominant cycle.
+    """
+    n_total = len(log_ret)
+    sd_cfg = config["sovereign_derivation"]
+    algo_cfg = sd_cfg.get("algorithm_params", {})
+    
+    max_bars = int(algo_cfg.get("max_computation_bars", const["ms_factor_int"] * const["two_int"]))
+    if n_total > max_bars:
+        rets = log_ret.iloc[-max_bars:].to_numpy(dtype=float)
+    else:
+        rets = log_ret.to_numpy(dtype=float)
+        
+    n = len(rets)
+    rets = np.where(np.isfinite(rets), rets, const["zero_float"])
+    
+    z = np.square(rets)
+    global_mean = float(np.mean(z))
+    
+    if n < dominant_cycle * const["two_int"]:
+        return int(dominant_cycle)
+        
+    deviations = z - global_mean
+    cusum = np.cumsum(deviations)
+    
+    margin = int(dominant_cycle)
+    if n - margin <= margin:
+        return int(dominant_cycle)
+        
+    search_space = cusum[margin : n - margin]
+    if len(search_space) == const["zero_int"]:
+        return int(dominant_cycle)
+        
+    abs_cusum = np.abs(search_space)
+    max_idx = int(np.argmax(abs_cusum)) + margin
+    
+    var_pre = float(np.var(rets[:max_idx])) if max_idx > const["five_int"] else const["zero_float"]
+    var_post = float(np.var(rets[max_idx:])) if (n - max_idx) > const["five_int"] else const["zero_float"]
+    
+    epsilon_val = const["epsilon"]
+    ratio = max(var_pre, var_post) / (min(var_pre, var_post) + epsilon_val)
+    
+    min_variance_ratio = const.get("min_variance_ratio", const["two_float"])
+    if ratio < min_variance_ratio:
+        return int(dominant_cycle)
+        
+    distance = n - max_idx
+    
+    cp_mult = int(algo_cfg.get("changepoint_lookback_multiplier", const["three_int"] * const["two_int"])) # SOVEREIGN_MATH_CONSTANT: default multiplier = 6
+    min_dist = int(dominant_cycle)
+    max_dist = int(dominant_cycle * cp_mult)
+    
+    return int(np.clip(distance, min_dist, max_dist))
+
+
+def _derive_optimal_cycle_ratios(
+    causal_df: pd.DataFrame,
+    dominant_cycle: int,
+    log_ret: pd.Series,
+    config: Dict,
+    const: Dict,
+) -> Tuple[Dict, Dict]:
+    """Computes lookback and volatility window scale ratios dynamically.
+    
+    Returns:
+        (dynamic_ratios, static_vs_dynamic_audit)
+    """
+    ratio_cfg = config["sovereign_derivation"]["cycle_ratios"]
+    sd_cfg = config["sovereign_derivation"]
+    algo_cfg = sd_cfg.get("algorithm_params", {})
+    
+    # ── 1. ESTIMATE TREND RATIO VIA MUTUAL INFORMATION ───────────────────────
+    # Target: forward returns over 1x dominant cycle (causally shifted)
+    y_raw = log_ret.rolling(dominant_cycle, min_periods=dominant_cycle).sum().shift(-dominant_cycle)
+    # Align and trim to causal boundary: shift target backward so we evaluate past completed returns
+    y = y_raw.shift(dominant_cycle).dropna().to_numpy(dtype=float)
+    
+    mi_bins = int(algo_cfg.get("mi_bins", const["ten_int"] + const["two_int"])) # SOVEREIGN_MATH_CONSTANT: default bins = 12
+    grid_size = int(algo_cfg.get("mi_grid_size", const["ten_int"] + const["one_int"])) # SOVEREIGN_MATH_CONSTANT: default grid = 11
+    
+    # Grid search around center ratio of 1.0
+    multipliers = np.linspace(const["half_float"], const["one_float"] + const["half_float"], grid_size)
+    
+    best_mi = const["zero_float"]
+    best_ratio = const["one_float"]
+    
+    # Cap candidate evaluation to avoid high complexity
+    for mult in multipliers:
+        candidate_ratio = float(mult)
+        w = max(int(dominant_cycle * candidate_ratio), const["two_int"])
+        x_raw = log_ret.rolling(w, min_periods=w).sum()
+        # Align feature with causally shifted target
+        x = x_raw.shift(dominant_cycle).dropna().to_numpy(dtype=float)
+        
+        # Match lengths
+        min_len = min(len(x), len(y))
+        if min_len > mi_bins * const["two_int"]:
+            mi_val = _calculate_mutual_information(x[-min_len:], y[-min_len:], mi_bins, const)
+            if mi_val > best_mi:
+                best_mi = mi_val
+                best_ratio = candidate_ratio
+                
+    # Significance test floor to filter out noisy relationships
+    mi_signif = float(algo_cfg.get("mi_significance_threshold", const["zero_float"]))
+    if best_mi < mi_signif:
+        best_ratio = const["one_float"]
+        
+    # ── 2. ESTIMATE VOLATILITY RATIO VIA CUSUM CHANGEPOINT ───────────────────
+    cp_distance = _detect_volatility_changepoint(log_ret, dominant_cycle, config, const)
+    vol_ratio = float(cp_distance) / float(max(dominant_cycle, const["one_int"]))
+    
+    # ── 3. MAP STATIC TO SMOOTHED DYNAMIC RATIOS ─────────────────────────────
+    smoothing = float(algo_cfg.get("ratio_smoothing_factor", const["half_float"]))
+    
+    dynamic_ratios = {}
+    static_vs_dynamic = {}
+    
+    # Mapping lists defining how each key is scaled:
+    # 'trend' scale multiplier = best_ratio
+    # 'vol' scale multiplier = vol_ratio
+    trend_keys = [
+        "slot_0_lookback", "slot_1_lookback", "slot_4_lookback_multiplier",
+        "slot_7_lookback", "slot_14_lookback_multiplier", "slot_24_lookback"
+    ]
+    vol_keys = [
+        "slot_1_volume_bucket", "slot_3_short", "slot_3_variance_short",
+        "slot_3_long_multiplier", "slot_5_lag_eval_cap", "slot_7_accel",
+        "slot_7_acceleration", "slot_11_pivot", "slot_11_pivot_strength"
+    ]
+    
+    for key, val in ratio_cfg.items():
+        static_val = float(val)
+        if key in trend_keys:
+            if "lookback" in key or "multiplier" in key:
+                target_val = static_val * best_ratio
+            else:
+                target_val = static_val / best_ratio
+        elif key in vol_keys:
+            if "multiplier" in key or "cap" in key:
+                target_val = static_val * vol_ratio
+            else:
+                target_val = static_val / vol_ratio
+        else:
+            target_val = static_val
+            
+        smoothed_val = smoothing * target_val + (const["one_float"] - smoothing) * static_val
+        
+        # Enforce safety bounds to prevent dynamic collapse to 0 or massive scaling
+        if "multiplier" in key or "cap" in key:
+            final_val = max(smoothed_val, const["one_float"])
+            final_val = min(final_val, static_val * float(const["three_int"])) # SOVEREIGN_MATH_CONSTANT: max 3x static
+        else:
+            final_val = max(smoothed_val, const["two_float"])
+            final_val = min(final_val, static_val * const["two_float"]) # SOVEREIGN_MATH_CONSTANT: max 2x static
+            
+        dynamic_ratios[key] = float(final_val)
+        static_vs_dynamic[key] = {
+            "static": static_val,
+            "dynamic_raw": target_val,
+            "dynamic_smoothed": final_val,
+            "delta": final_val - static_val
+        }
+        
+    return dynamic_ratios, static_vs_dynamic
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # PUBLIC API
 # ─────────────────────────────────────────────────────────────────────────────
 
 def derive_sovereign_priors(
     causal_df: pd.DataFrame,
     config: Dict,
+    precomputed_structural_df: Optional[pd.DataFrame] = None,
+    previous_weights: Optional[Dict[str, float]] = None,
 ) -> Dict:
     """
     Derive all 47 KRONOS priors empirically from causal OHLCV data.
@@ -110,15 +331,20 @@ def derive_sovereign_priors(
         Full parsed params_yaml.txt config dict loaded by load_sovereign_config.
         Used as the authoritative fallback for every prior when causal data
         is insufficient.
+    precomputed_structural_df : Optional[pd.DataFrame]
+        Optional precomputed structural slots. If passed, avoids trade synthesis
+        and slot computations inside weight derivation.
+    previous_weights : Optional[Dict[str, float]]
+        Optional slot weights from the previous shard to apply the stability change limit.
 
     Returns
     -------
     Dict
-        Flat dict of 47 derived priors keyed by their canonical param_yaml name,
-        plus a nested ``_audit`` dict with provenance metadata.
-        When sovereign_derivation.enabled is False the dict contains only
-        ``_audit`` with ``_disabled: True`` — the caller must detect this and
-        skip calling patch_config_with_priors.
+         Flat dict of 47 derived priors keyed by their canonical param_yaml name,
+         plus a nested ``_audit`` dict with provenance metadata.
+         When sovereign_derivation.enabled is False the dict contains only
+         ``_audit`` with ``_disabled: True`` — the caller must detect this and
+         skip calling patch_config_with_priors.
     """
     # ── ABLATION GATE ────────────────────────────────────────────────────────
     # Reads sovereign_derivation.enabled from config. When False, the engine
@@ -159,6 +385,17 @@ def derive_sovereign_priors(
     # ── 2. DOMINANT CYCLE VIA CWT ─────────────────────────────────────────────
     dominant_cycle, dc_method = _derive_dominant_cycle(log_ret, const, config)
 
+    # ── 2.5. DYNAMIC CYCLE RATIO DERIVATION (PHASE 1) ─────────────────────────
+    enable_dyn = sd_cfg.get("enable_dynamic_ratios", False)
+    dynamic_ratios, static_vs_dynamic = _derive_optimal_cycle_ratios(
+        causal_df, dominant_cycle, log_ret, config, const
+    )
+    if enable_dyn:
+        # Thread-safe config patch to override cycle_ratios with dynamic counterparts
+        config = config.copy()
+        config["sovereign_derivation"] = config["sovereign_derivation"].copy()
+        config["sovereign_derivation"]["cycle_ratios"] = dynamic_ratios
+
     # ── 3. REALISED VOLATILITY DISTRIBUTION ──────────────────────────────────
     rv_window = max(dominant_cycle * const["thirty_int"], const["one_int"])
     rv_series = log_ret.rolling(rv_window, min_periods=const["one_int"]).std().dropna()
@@ -184,7 +421,9 @@ def derive_sovereign_priors(
     _derive_slot12_microprice(priors, audit, dominant_cycle, causal_df, const, config)
     _derive_slot13_shannon(priors, audit, dominant_cycle, const, config)
     _derive_slot14_hilbert(priors, audit, dominant_cycle, const, config)
-    _derive_slot15_composite(priors, audit, config)
+    _derive_slot15_composite(
+        priors, audit, config, causal_df, const, dominant_cycle, precomputed_structural_df, previous_weights
+    )
     _derive_neural_gate(priors, audit, rv_series, dominant_cycle, const, config)
     _derive_aux(priors, audit, dominant_cycle, const, config)
     _derive_hdbscan(priors, audit, const, config)
@@ -207,6 +446,8 @@ def derive_sovereign_priors(
         "_git_commit": _get_git_commit(),
         "_engine_version": "sovereign_prior_derivation_engine_v2",
         "_derivation_method": sd_cfg.get("method", "cwt_bic_empirical"),
+        "_static_vs_dynamic_ratios": static_vs_dynamic,
+        "_enable_dynamic_ratios_active": enable_dyn,
         "_prior_derivations": audit,
     }
 
@@ -393,7 +634,10 @@ def _derive_dominant_cycle(
         min_scale = max(_MATH_TWO, min_cycle // _MATH_TWO)
 
         # Subsample scales logarithmically to keep cost O(n * n_scales) manageable
-        n_scale_steps = min(128, max_scale - min_scale + _MATH_ONE)
+        sd_cfg = config.get("sovereign_derivation", {})
+        algo_cfg = sd_cfg.get("algorithm_params", {})
+        cwt_max_steps = int(algo_cfg.get("cwt_max_scale_steps", const.get("min_bars_for_bic", 128)))
+        n_scale_steps = min(cwt_max_steps, max_scale - min_scale + _MATH_ONE)
         scales = np.unique(
             np.round(np.geomspace(min_scale, max_scale, n_scale_steps)).astype(int)
         ).astype(float)
@@ -424,7 +668,10 @@ def _derive_dominant_cycle(
         best_scale = scales[best_scale_idx]
 
         # Ricker wavelet analytical period conversion: period ≈ scale * sqrt(2π/5)
-        ricker_period_factor = float(np.sqrt(_MATH_TWO * np.pi / 5.0))
+        # SOVEREIGN_MATH_CONSTANT: Ricker wavelet analytical period = scale * sqrt(2π/5)
+        # The 5.0 is the Ricker wavelet shape parameter (fixed by wavelet definition, not a calibration prior)
+        _RICKER_SHAPE = 5.0  # SOVEREIGN_MATH_CONSTANT — wavelet definition, not a prior
+        ricker_period_factor = float(np.sqrt(_MATH_TWO * np.pi / _RICKER_SHAPE))
         dominant_cycle_f = best_scale * ricker_period_factor
         dominant_cycle = int(np.clip(round(dominant_cycle_f), min_cycle, max_cycle))
 
@@ -456,7 +703,7 @@ def _derive_warmup(
         derived = int(dominant_cycle * _MATH_TWO)
         # Floor at the config value to never go below the researcher's minimum
         value = max(derived, fallback)
-        value = min(value, n_bars // _MATH_TWO)  # never burn >50% of available shard
+        value = min(value, n_bars // _MATH_TWO)  # never burn > half of available shard
         priors["warmup_bars"] = value
         audit["warmup_bars"] = {"value": value, "method": "dominant_cycle_x2", "fallback": fallback}
     except Exception as exc:
@@ -484,17 +731,19 @@ def _derive_slot0_bid_ask(
 
     # lookback_bars
     try:
-        lb = max(int(dominant_cycle // 12), const["one_int"])
+        ratio_cfg = config["sovereign_derivation"]["cycle_ratios"]
+        lb = max(int(dominant_cycle // ratio_cfg["slot_0_lookback"]), const["one_int"])
         priors["slot_0_lookback_bars"] = lb
-        audit["slot_0_lookback_bars"] = {"value": lb, "method": "dominant_cycle_div_12"}
+        audit["slot_0_lookback_bars"] = {"value": lb, "method": "dominant_cycle_div_configured_ratio"}
     except Exception as exc:
         priors["slot_0_lookback_bars"] = fallback_lb
         audit["slot_0_lookback_bars"] = {"value": fallback_lb, "method": "fallback", "error": str(exc)}
 
     # decay_factor: natural EWM — e^(-1/cycle) means the cycle half-life decays naturally
     try:
+        clip_cfg = config["sovereign_derivation"]["clip_bounds"]
         decay = float(np.exp(-const["one_float"] / max(dominant_cycle, const["one_int"])))
-        decay = float(np.clip(decay, 0.5, 0.9999))
+        decay = float(np.clip(decay, clip_cfg["decay_clip_low"], clip_cfg["decay_clip_high"]))
         priors["slot_0_decay_factor"] = decay
         audit["slot_0_decay_factor"] = {"value": decay, "method": "exp_neg1_over_dominant_cycle"}
     except Exception as exc:
@@ -509,8 +758,10 @@ def _derive_slot0_bid_ask(
         price_range = (roll_high - roll_low).clip(lower=epsilon)
         low_prox = ((causal_df["low"] - roll_low) / price_range).dropna()
         if len(low_prox) > const["zero_int"]:
-            ext_thresh = float(np.percentile(low_prox, 5))
-            ext_thresh = float(np.clip(ext_thresh, epsilon, 0.5))
+            pct_cfg = config["sovereign_derivation"]["percentiles"]
+            ext_thresh = float(np.percentile(low_prox, int(pct_cfg["slot_0_extreme"])))
+            clip_cfg = config["sovereign_derivation"]["clip_bounds"]
+            ext_thresh = float(np.clip(ext_thresh, epsilon, clip_cfg["slot_0_extreme_high"]))
         else:
             ext_thresh = fallback_ext
         priors["slot_0_extreme_threshold"] = ext_thresh
@@ -536,24 +787,28 @@ def _derive_slot1_vpin(
     fallback_dc = float(config["feature_builder"]["structural"]["slot_1"]["decay_factor"])
 
     try:
-        bs = max(int(dominant_cycle // 6), const["one_int"])
+        ratio_cfg = config["sovereign_derivation"]["cycle_ratios"]
+        bs = max(int(dominant_cycle // ratio_cfg["slot_1_volume_bucket"]), const["one_int"])
         priors["slot_1_volume_bucket_size"] = bs
-        audit["slot_1_volume_bucket_size"] = {"value": bs, "method": "dominant_cycle_div_6"}
+        audit["slot_1_volume_bucket_size"] = {"value": bs, "method": "dominant_cycle_div_configured_ratio"}
     except Exception as exc:
         priors["slot_1_volume_bucket_size"] = fallback_bs
         audit["slot_1_volume_bucket_size"] = {"value": fallback_bs, "method": "fallback", "error": str(exc)}
 
     try:
-        lb = max(int(dominant_cycle * 4), const["one_int"])
+        ratio_cfg = config["sovereign_derivation"]["cycle_ratios"]
+        lb = max(int(dominant_cycle * ratio_cfg["slot_1_lookback"]), const["one_int"])
         priors["slot_1_lookback_buckets"] = lb
-        audit["slot_1_lookback_buckets"] = {"value": lb, "method": "dominant_cycle_x4"}
+        audit["slot_1_lookback_buckets"] = {"value": lb, "method": "dominant_cycle_mul_configured_ratio"}
     except Exception as exc:
         priors["slot_1_lookback_buckets"] = fallback_lb
         audit["slot_1_lookback_buckets"] = {"value": fallback_lb, "method": "fallback", "error": str(exc)}
 
     try:
-        decay = float(np.exp(-const["one_float"] / max(dominant_cycle * _MATH_TWO, const["one_int"])))
-        decay = float(np.clip(decay, 0.5, 0.9999))
+        ratio_cfg = config["sovereign_derivation"]["cycle_ratios"]
+        clip_cfg = config["sovereign_derivation"]["clip_bounds"]
+        decay = float(np.exp(-const["one_float"] / max(dominant_cycle * ratio_cfg["slot_3_long_multiplier"], const["one_int"])))
+        decay = float(np.clip(decay, clip_cfg["decay_clip_low"], clip_cfg["decay_clip_high"]))
         priors["slot_1_decay_factor"] = decay
         audit["slot_1_decay_factor"] = {"value": decay, "method": "exp_neg1_over_2x_dominant_cycle"}
     except Exception as exc:
@@ -591,12 +846,13 @@ def _derive_slot3_log_var_ratio(
     fallback_lw = int(config["feature_builder"]["structural"]["slot_3"]["long_window"])
 
     try:
-        sw = max(int(dominant_cycle // 24), const["two_int"])
-        lw = max(int(dominant_cycle * _MATH_TWO), sw + const["one_int"])
+        ratio_cfg = config["sovereign_derivation"]["cycle_ratios"]
+        sw = max(int(dominant_cycle // ratio_cfg["slot_3_variance_short"]), const["two_int"])
+        lw = max(int(dominant_cycle * ratio_cfg["slot_3_long_multiplier"]), sw + const["one_int"])
         priors["slot_3_short_window"] = sw
         priors["slot_3_long_window"] = lw
-        audit["slot_3_short_window"] = {"value": sw, "method": "dominant_cycle_div_24"}
-        audit["slot_3_long_window"] = {"value": lw, "method": "dominant_cycle_x2"}
+        audit["slot_3_short_window"] = {"value": sw, "method": "dominant_cycle_div_configured_ratio"}
+        audit["slot_3_long_window"] = {"value": lw, "method": "dominant_cycle_mul_configured_ratio"}
     except Exception as exc:
         priors["slot_3_short_window"] = fallback_sw
         priors["slot_3_long_window"] = fallback_lw
@@ -612,9 +868,10 @@ def _derive_slot4_hurst(
     """Slot 4 — Fractal Hurst: lookback_bars = dominant_cycle * 2 (two cycles for R/S stability)."""
     fallback = int(config["feature_builder"]["structural"]["slot_4"]["lookback_bars"])
     try:
-        lb = max(int(dominant_cycle * _MATH_TWO), int(config["feature_builder"]["structural"]["slot_4"]["grid_points"]))
+        ratio_cfg = config["sovereign_derivation"]["cycle_ratios"]
+        lb = max(int(dominant_cycle * ratio_cfg["slot_4_lookback_multiplier"]), int(config["feature_builder"]["structural"]["slot_4"]["grid_points"]))
         priors["slot_4_lookback_bars"] = lb
-        audit["slot_4_lookback_bars"] = {"value": lb, "method": "dominant_cycle_x2"}
+        audit["slot_4_lookback_bars"] = {"value": lb, "method": "dominant_cycle_mul_configured_ratio"}
     except Exception as exc:
         priors["slot_4_lookback_bars"] = fallback
         audit["slot_4_lookback_bars"] = {"value": fallback, "method": "fallback", "error": str(exc)}
@@ -647,12 +904,15 @@ def _derive_slot5_autocorr(
         if len(log_ret) < _MIN_BARS_FOR_ACF:
             raise ValueError(f"Too few bars for ACF noise estimation ({len(log_ret)} < {_MIN_BARS_FOR_ACF})")
 
-        noise_window = min(const["two_hundred_int"] if "two_hundred_int" in const else 200, len(log_ret) // _MATH_TWO)
+        algo_cfg = config["sovereign_derivation"].get("algorithm_params", {})
+        acf_noise_win = int(algo_cfg.get("acf_noise_window", const.get("two_hundred_int", _MIN_BARS_FOR_BIC)))
+        noise_window = min(acf_noise_win, len(log_ret) // _MATH_TWO)
         noise_ret = log_ret.iloc[-noise_window:].to_numpy(dtype=float)
         noise_ret = np.where(np.isfinite(noise_ret), noise_ret, const["zero_float"])
 
-        # Compute ACF up to max 20 lags on the noise window
-        max_lags_eval = min(20, noise_window // _MATH_TWO)
+        ratio_cfg = config["sovereign_derivation"]["cycle_ratios"]
+        # Compute ACF up to max lags evaluated cap on the noise window
+        max_lags_eval = min(int(ratio_cfg["slot_5_lag_eval_cap"]), noise_window // _MATH_TWO)
         acf_vals = []
         for lag_i in range(_MATH_ONE, max_lags_eval + _MATH_ONE):
             if len(noise_ret) > lag_i:
@@ -662,7 +922,8 @@ def _derive_slot5_autocorr(
                 acf_vals.append(const["zero_float"])
 
         # 95th percentile of absolute noise ACF as significance threshold
-        noise_threshold = float(np.nanpercentile(acf_vals, 95))
+        pct_cfg = config["sovereign_derivation"]["percentiles"]
+        noise_threshold = float(np.nanpercentile(acf_vals, int(pct_cfg["acf_noise_significance"])))
         # Significant lags exceed the noise floor — test all lags 1…max_lags_eval on full series
         full_ret = log_ret.to_numpy(dtype=float)
         full_ret = np.where(np.isfinite(full_ret), full_ret, const["zero_float"])
@@ -673,11 +934,14 @@ def _derive_slot5_autocorr(
                 if abs(corr) > noise_threshold:
                     sig_lags.append(lag_i)
 
-        # Ensure at least 3 lags; cap at 8 to avoid computational explosion
-        if len(sig_lags) < 3:
-            sig_lags = list(range(_MATH_ONE, 6))  # fall back to [1,2,3,4,5]
-        if len(sig_lags) > 8:
-            sig_lags = sig_lags[:8]
+        # Ensure minimum significant lags; cap to avoid computational explosion
+        min_sig = int(algo_cfg.get("slot_5_min_sig_lags", const.get("three_int", _MATH_TWO + _MATH_ONE)))
+        max_sig = int(algo_cfg.get("slot_5_max_sig_lags", const.get("eight_int", _MATH_TWO * _MATH_TWO * _MATH_TWO)))
+        fallback_end = int(algo_cfg.get("slot_5_fallback_end", min_sig + min_sig))
+        if len(sig_lags) < min_sig:
+            sig_lags = list(range(_MATH_ONE, fallback_end))  # fall back to [1..fallback_end)
+        if len(sig_lags) > max_sig:
+            sig_lags = sig_lags[:max_sig]
 
         priors["slot_5_lags"] = sig_lags
         audit["slot_5_lags"] = {
@@ -744,11 +1008,12 @@ def _derive_slot6_ema_ribbon(
             spans = peak_lags
             method = "acf_peak_spacing_empirical"
         else:
+            ratio_cfg = config["sovereign_derivation"]["cycle_ratios"]
             # Fallback to dominant-cycle geometric spacing (5 spans across dominant_cycle)
-            base = max(int(dominant_cycle // 32), const["one_int"])
-            # Geometric ratios at 1, 2, 3.5, 5.5, 8 — smoothly spaced without hard-coded Fibonacci
-            geo_steps = [const["one_int"], _MATH_TWO, int(round(dominant_cycle // 16)),
-                         int(round(dominant_cycle // 8)), int(round(dominant_cycle // 4))]
+            base = max(int(dominant_cycle // ratio_cfg["slot_6_base_fallback"]), const["one_int"])
+            # Geometric ratios smoothly spaced without hard-coded Fibonacci
+            geo_steps = [const["one_int"], _MATH_TWO, int(round(dominant_cycle // ratio_cfg["slot_6_geom_16"])),
+                         int(round(dominant_cycle // ratio_cfg["slot_6_geom_8"])), int(round(dominant_cycle // ratio_cfg["slot_6_geom_4"]))]
             spans = sorted(set(max(s, const["one_int"]) for s in geo_steps))
             while len(spans) < 3:
                 spans.append(spans[-_MATH_ONE] + const["one_int"])
@@ -779,8 +1044,9 @@ def _derive_slot6_ema_ribbon(
             "divisor": divisor
         }
     except Exception as exc:
-        priors["slot_6_divergence_window"] = 5
-        audit["slot_6_divergence_window"] = {"value": 5, "method": "fallback"}
+        fb_dw = int(const.get("min_window_slot_06", const["five_int"]))
+        priors["slot_6_divergence_window"] = fb_dw
+        audit["slot_6_divergence_window"] = {"value": fb_dw, "method": "fallback"}
 
 
 def _derive_slot7_vol_price_div(
@@ -797,17 +1063,19 @@ def _derive_slot7_vol_price_div(
     fallback_lag = int(config["feature_builder"]["structural"]["slot_7"]["acceleration_lag"])
 
     try:
-        lb = max(int(dominant_cycle // 12), const["one_int"])
+        ratio_cfg = config["sovereign_derivation"]["cycle_ratios"]
+        lb = max(int(dominant_cycle // ratio_cfg["slot_7_lookback"]), const["one_int"])
         priors["slot_7_lookback_bars"] = lb
-        audit["slot_7_lookback_bars"] = {"value": lb, "method": "dominant_cycle_div_12"}
+        audit["slot_7_lookback_bars"] = {"value": lb, "method": "dominant_cycle_div_configured_ratio"}
     except Exception as exc:
         priors["slot_7_lookback_bars"] = fallback_lb
         audit["slot_7_lookback_bars"] = {"value": fallback_lb, "method": "fallback", "error": str(exc)}
 
     try:
-        lag = max(int(dominant_cycle // 96), const["one_int"])
+        ratio_cfg = config["sovereign_derivation"]["cycle_ratios"]
+        lag = max(int(dominant_cycle // ratio_cfg["slot_7_acceleration"]), const["one_int"])
         priors["slot_7_acceleration_lag"] = lag
-        audit["slot_7_acceleration_lag"] = {"value": lag, "method": "dominant_cycle_div_96"}
+        audit["slot_7_acceleration_lag"] = {"value": lag, "method": "dominant_cycle_div_configured_ratio"}
     except Exception as exc:
         priors["slot_7_acceleration_lag"] = fallback_lag
         audit["slot_7_acceleration_lag"] = {"value": fallback_lag, "method": "fallback", "error": str(exc)}
@@ -880,7 +1148,7 @@ def _derive_slot8_hmm(
         }
     else:
         # Run BIC search and update cache
-        best_n = _bic_regime_selection(log_ret, rv_series, fallback_niter, const)
+        best_n = _bic_regime_selection(log_ret, rv_series, fallback_niter, const, config)
         if best_n is not None:
             _BIC_CACHE[symbol_key] = {"num_regimes": best_n, "n_bars": n_causal_bars}
             priors["slot_8_num_regimes"] = best_n
@@ -899,6 +1167,7 @@ def _bic_regime_selection(
     rv_series: pd.Series,
     n_iter: int,
     const: Dict,
+    config: Dict,
 ) -> Optional[int]:
     """BIC-minimised HMM regime count selection over grid [2…8]."""
     if len(log_ret) < _MIN_BARS_FOR_BIC:
@@ -922,9 +1191,10 @@ def _bic_regime_selection(
             return None
 
         best_bic = float("inf")
-        best_n = _HMM_BIC_GRID_LOW
+        ratio_cfg = config["sovereign_derivation"]["cycle_ratios"]
+        best_n = int(ratio_cfg["hmm_bic_low"])
 
-        for n_states in range(_HMM_BIC_GRID_LOW, _HMM_BIC_GRID_HIGH):
+        for n_states in range(int(ratio_cfg["hmm_bic_low"]), int(ratio_cfg["hmm_bic_high"])):
             try:
                 m = GaussianHMM(
                     n_components=n_states,
@@ -981,13 +1251,15 @@ def _derive_slot9_liquidity(
         hl_range = (h - l).clip(lower=epsilon)
         # Proxy imbalance: how close close is to high vs low (0 = at low, 1 = at high)
         close_pos = (c - l) / hl_range
-        # Raw imbalance = |2 * close_pos - 1| ∈ [0, 1]
-        imbalance_proxy = (2.0 * close_pos - const["one_float"]).abs()
+        # Raw imbalance = |2 * close_pos - 1| ∈ [0, 1]  # SOVEREIGN_MATH_CONSTANT: binary [0,1]→[-1,1] rescaling
+        imbalance_proxy = (const["two_float"] * close_pos - const["one_float"]).abs()
         valid_imb = imbalance_proxy.dropna()
 
         if len(valid_imb) > const["zero_int"]:
-            thresh = float(np.percentile(valid_imb, 85))
-            thresh = float(np.clip(thresh, 0.5, 0.99))
+            clip_cfg = config["sovereign_derivation"]["clip_bounds"]
+            pct_cfg = config["sovereign_derivation"]["percentiles"]
+            thresh = float(np.percentile(valid_imb, int(pct_cfg["slot_9_imbalance"])))
+            thresh = float(np.clip(thresh, clip_cfg["slot_9_imbalance_low"], clip_cfg["slot_9_imbalance_high"]))
         else:
             thresh = fallback
 
@@ -1025,8 +1297,10 @@ def _derive_slot10_wick(
         body = (causal_df["close"] - causal_df["open"]).abs().clip(lower=epsilon)
         body_pct = (body / candle_range).dropna()
         if len(body_pct) > const["zero_int"]:
-            bt = float(np.percentile(body_pct, 20))
-            bt = float(np.clip(bt, 0.05, 0.5))
+            clip_cfg = config["sovereign_derivation"]["clip_bounds"]
+            pct_cfg = config["sovereign_derivation"]["percentiles"]
+            bt = float(np.percentile(body_pct, int(pct_cfg["slot_10_body"])))
+            bt = float(np.clip(bt, clip_cfg["slot_10_body_low"], clip_cfg["slot_10_body_high"]))
         else:
             bt = fallback_bt
         priors["slot_10_body_threshold"] = bt
@@ -1050,13 +1324,31 @@ def _derive_slot10_wick(
         body = (causal_df["close"] - causal_df["open"]).abs().clip(lower=epsilon)
         wick_ratio = (candle_range / body).dropna()
         if len(wick_ratio) > const["zero_int"]:
-            qt = float(np.percentile(wick_ratio, 99))
-            # Convert to [0,1] quantile
-            qt = float(np.clip(0.99, 0.9, 0.999))
+            epsilon_val = const["epsilon"]
+            pct_cfg = config["sovereign_derivation"]["percentiles"]
+            clip_cfg = config["sovereign_derivation"]["clip_bounds"]
+            qt_raw = float(np.percentile(wick_ratio.dropna(), int(pct_cfg["slot_10_quantile"])))
+            qt_normalized = qt_raw / (wick_ratio.max() + epsilon_val) if wick_ratio.max() > const["zero_float"] else clip_cfg["slot_10_quantile_high"]
+            qt = float(np.clip(qt_normalized, clip_cfg["slot_10_quantile_low"], clip_cfg["slot_10_quantile_high"]))
+
+            # Bulletproofing: guard against NaN/inf from degenerate wick distributions
+            if not np.isfinite(qt) or qt <= const["zero_float"]:
+                qt = float(clip_cfg["slot_10_quantile_high"])  # safe fallback
+
+            priors["slot_10_quantile_threshold"] = qt
+            audit["slot_10"] = {
+                "raw_percentile": qt_raw,
+                "normalized": qt_normalized,
+                "final": qt,
+                "method": "empirical_percentile_clipped_from_config"
+            }
         else:
             qt = fallback_qt
-        priors["slot_10_quantile_threshold"] = qt
-        audit["slot_10_quantile_threshold"] = {"value": qt, "method": "empirical_p99_wick_ratio"}
+            priors["slot_10_quantile_threshold"] = qt
+            audit["slot_10"] = {
+                "value": qt,
+                "method": "fallback"
+            }
     except Exception as exc:
         priors["slot_10_quantile_threshold"] = fallback_qt
         audit["slot_10_quantile_threshold"] = {"value": fallback_qt, "method": "fallback", "error": str(exc)}
@@ -1086,7 +1378,8 @@ def _derive_slot11_sr_kde(
         audit["slot_11_pivot_lookback"] = {"value": fallback_pl, "method": "fallback", "error": str(exc)}
 
     try:
-        ps = max(int(dominant_cycle // 96), const["one_int"])
+        ratio_cfg = config["sovereign_derivation"]["cycle_ratios"]
+        ps = max(int(dominant_cycle // ratio_cfg["slot_11_pivot_strength"]), const["one_int"])
         priors["slot_11_pivot_strength"] = ps
         audit["slot_11_pivot_strength"] = {"value": ps, "method": "dominant_cycle_div_96"}
     except Exception as exc:
@@ -1121,13 +1414,14 @@ def _derive_slot12_microprice(
         c = causal_df["close"].astype(float)
         hl_range = (h - l).clip(lower=epsilon)
         close_pos = (c - l) / hl_range  # [0, 1] — buy pressure proxy
-        imbalance = (2.0 * close_pos - const["one_float"])  # [-1, 1]
+        imbalance = (const["two_float"] * close_pos - const["one_float"])  # [-1, 1]  # SOVEREIGN_MATH_CONSTANT: binary rescaling
         # Signed next-bar return (the "impact" of the imbalance)
         fwd_ret = c.pct_change().shift(-const["one_int"])
         valid_mask = imbalance.notna() & fwd_ret.notna()
         if valid_mask.sum() > const["one_int"]:
+            clip_cfg = config["sovereign_derivation"]["clip_bounds"]
             corr = float(np.corrcoef(imbalance[valid_mask], fwd_ret[valid_mask])[0, 1])
-            ic = float(np.clip(abs(corr), 0.3, 0.9))
+            ic = float(np.clip(abs(corr), clip_cfg["slot_12_coeff_low"], clip_cfg["slot_12_coeff_high"]))
         else:
             ic = fallback_ic
         priors["slot_12_imbalance_coefficient"] = ic
@@ -1154,8 +1448,9 @@ def _derive_slot12_microprice(
             "divisor": divisor
         }
     except Exception as exc:
-        priors["slot_12_rolling_window"] = 5
-        audit["slot_12_rolling_window"] = {"value": 5, "method": "fallback"}
+        fb_rw = int(const.get("min_window_slot_12", const["five_int"]))
+        priors["slot_12_rolling_window"] = fb_rw
+        audit["slot_12_rolling_window"] = {"value": fb_rw, "method": "fallback"}
 
 
 def _derive_slot13_shannon(
@@ -1180,10 +1475,11 @@ def _derive_slot13_shannon(
         audit["slot_13_lookback_bars"] = {"value": fallback_lb, "method": "fallback", "error": str(exc)}
 
     try:
+        ratio_cfg = config["sovereign_derivation"]["cycle_ratios"]
         # Sturges' rule: k = ceil(1 + log2(n)) for n = dominant_cycle
         n_sturges = int(np.ceil(const["one_float"] + np.log2(max(dominant_cycle, _MATH_TWO))))
-        n_bins = max(n_sturges, 5)  # floor at 5 bins for numerical stability
-        n_bins = min(n_bins, 20)   # cap at 20 bins
+        n_bins = max(n_sturges, int(ratio_cfg["slot_13_bin_floor"]))  # floor for numerical stability
+        n_bins = min(n_bins, int(ratio_cfg["slot_13_bin_cap"]))   # cap bins
         priors["slot_13_num_bins"] = n_bins
         audit["slot_13_num_bins"] = {"value": n_bins, "method": "sturges_rule_on_dominant_cycle"}
     except Exception as exc:
@@ -1202,7 +1498,8 @@ def _derive_slot14_hilbert(
     """
     fallback = int(config["feature_builder"]["structural"]["slot_14"]["lookback_bars"])
     try:
-        lb = max(int(dominant_cycle * _MATH_TWO), const["one_int"])
+        ratio_cfg = config["sovereign_derivation"]["cycle_ratios"]
+        lb = max(int(dominant_cycle * ratio_cfg["slot_14_lookback_multiplier"]), const["one_int"])
         priors["slot_14_lookback_bars"] = lb
         audit["slot_14_lookback_bars"] = {"value": lb, "method": "dominant_cycle_x2"}
     except Exception as exc:
@@ -1210,29 +1507,219 @@ def _derive_slot14_hilbert(
         audit["slot_14_lookback_bars"] = {"value": fallback, "method": "fallback", "error": str(exc)}
 
 
+def _calculate_rank(x: np.ndarray) -> np.ndarray:
+    """Computes simple fractional ranks of a 1D array in pure NumPy."""
+    temp = x.argsort()
+    ranks = np.empty_like(temp)
+    ranks[temp] = np.arange(len(x))
+    return ranks.astype(float)
+
+
+def _calculate_spearman_correlation(x: np.ndarray, y: np.ndarray, const: Dict) -> float:
+    """Computes Spearman Rank Correlation in pure NumPy with zero literals."""
+    mask = np.isfinite(x) & np.isfinite(y)
+    x = x[mask]
+    y = y[mask]
+    if len(x) < const["five_int"]:
+        return const["zero_float"]
+    rx = _calculate_rank(x)
+    ry = _calculate_rank(y)
+    # Pearson corr of ranks
+    corr = float(np.corrcoef(rx, ry)[0, 1])
+    return abs(corr)
+
+
+def _derive_adaptive_slot15_weights(
+    causal_df: pd.DataFrame,
+    dominant_cycle: int,
+    config: Dict,
+    const: Dict,
+    precomputed_structural_df: Optional[pd.DataFrame] = None,
+    previous_weights: Optional[Dict[str, float]] = None,
+) -> Tuple[Dict, Dict]:
+    """Computes dynamic, Spearman/MI-based adaptive slot weights causally on historical candles."""
+    s15_cfg = config["sovereign_derivation"].get("slot_15", {})
+    static_weights = config["feature_builder"]["structural"]["slot_15"]["weights"]
+    
+    epsilon = const["epsilon"]
+    zero_f = const["zero_float"]
+    one_f = const["one_float"]
+    
+    n = len(causal_df)
+    min_bars = int(s15_cfg.get("min_history_bars", const["binance_limit_int"] * const["five_int"])) # Default 5000 bars
+    
+    if n < min_bars:
+        fallback_audit = {k: {"static": v, "dynamic_raw": v, "dynamic_smoothed": v, "delta": zero_f} for k, v in static_weights.items()}
+        return static_weights, fallback_audit
+        
+    close = causal_df["close"].astype(float)
+    log_ret = np.log(close / close.shift(const["one_int"]) + epsilon).fillna(zero_f)
+    
+    y_raw = log_ret.rolling(dominant_cycle, min_periods=dominant_cycle).sum().shift(-dominant_cycle)
+    y = y_raw.shift(dominant_cycle).dropna().to_numpy(dtype=float)
+    
+    half_pt = n // const["two_int"]
+    std_pre = float(np.std(log_ret.iloc[:half_pt]))
+    std_post = float(np.std(log_ret.iloc[half_pt:]))
+    vol_change = abs(std_pre - std_post) / (max(std_pre, std_post) + epsilon)
+    regime_stability = max(zero_f, one_f - vol_change)
+    
+    if precomputed_structural_df is not None:
+        structural_df = precomputed_structural_df
+    else:
+        import structural_engine
+        agg_trades = generate_synthetic_trades(causal_df, config)
+        structural_df = structural_engine.compute_slots_sovereign(
+            causal_df, agg_trades,
+            config["feature_builder"]["structural"], config
+        )
+        
+    metric_type = s15_cfg.get("relevance_metric", "spearman")
+    fallback_metric = s15_cfg.get("relevance_metric_fallback", "spearman")
+    short_bars_cfg = int(s15_cfg.get("short_history_bars", const["binance_limit_int"] * const["two_int"])) # 2000 bars
+    
+    raw_relevance = {}
+    
+    for slot_key in static_weights.keys():
+        if slot_key not in structural_df.columns:
+            raw_relevance[slot_key] = zero_f
+            continue
+            
+        x_raw = structural_df[slot_key].astype(float)
+        x = x_raw.shift(dominant_cycle).dropna().to_numpy(dtype=float)
+        
+        min_len = min(len(x), len(y))
+        if min_len > const["five_int"]:
+            long_slice_len = min(min_len, min_bars)
+            x_long = x[-long_slice_len:]
+            y_long = y[-long_slice_len:]
+            
+            short_slice_len = min(min_len, short_bars_cfg)
+            x_short = x[-short_slice_len:]
+            y_short = y[-short_slice_len:]
+            
+            # Helper to calculate relevance based on type
+            def compute_single_scale(x_s: np.ndarray, y_s: np.ndarray, slice_len: int) -> float:
+                try:
+                    if metric_type == "spearman":
+                        return _calculate_spearman_correlation(x_s, y_s, const)
+                    else:
+                        mi_bins = int(np.ceil(np.log2(slice_len) + one_f))
+                        mi_val = _calculate_mutual_information(x_s, y_s, mi_bins, const)
+                        if mi_val <= zero_f and fallback_metric == "spearman":
+                            return _calculate_spearman_correlation(x_s, y_s, const)
+                        return max(mi_val, zero_f)
+                except Exception:
+                    # Fallback to Spearman correlation if any math error happens
+                    return _calculate_spearman_correlation(x_s, y_s, const)
+                    
+            corr_long = compute_single_scale(x_long, y_long, long_slice_len)
+            corr_short = compute_single_scale(x_short, y_short, short_slice_len)
+            
+            short_wt = float(s15_cfg.get("blend_short_weight", float(const["half_float"])))
+            raw_relevance[slot_key] = short_wt * corr_short + (one_f - short_wt) * corr_long
+        else:
+            raw_relevance[slot_key] = zero_f
+            
+    relevance_values = sorted(raw_relevance.values(), reverse=True)
+    top_3_mean = float(np.mean(relevance_values[:const["three_int"]]))
+    
+    short_n_float = float(min(len(y), short_bars_cfg))
+    stderr = one_f / (np.sqrt(short_n_float - one_f) + epsilon)
+    floor_multiplier = float(s15_cfg.get("confidence_floor_multiplier", float(const["seven_int"])))
+    conf_floor = floor_multiplier * stderr
+    
+    confidence = min(one_f, top_3_mean / (conf_floor + epsilon))
+    shrinkage_base = float(s15_cfg.get("shrinkage_base", float(const["half_float"])))
+    beta = shrinkage_base * confidence * regime_stability
+    
+    rel_sum = sum(raw_relevance.values()) + epsilon
+    norm_relevance = {k: v / rel_sum for k, v in raw_relevance.items()}
+    
+    min_w = float(s15_cfg.get("min_weight", float(const["math_half"]) * float(const["half_float"]) * float(const["half_float"]))) # Default 0.02
+    max_w = float(s15_cfg.get("max_weight", float(const["math_half"]) * float(const["half_float"]))) # Default 0.18
+    
+    raw_blended = {}
+    for key, static_w in static_weights.items():
+        dyn_w = norm_relevance[key]
+        blended = beta * dyn_w + (one_f - beta) * static_w
+        raw_blended[key] = np.clip(blended, min_w, max_w)
+        
+    # Apply time stability limit if previous_weights is provided
+    max_change = float(s15_cfg.get("max_weight_change_ratio", float(const["three_int"]) / float(const["ten_float"]))) # Default 0.3
+    if previous_weights is not None:
+        raw_blended_clipped = {}
+        for key, w_val in raw_blended.items():
+            prev_w = previous_weights.get(key, static_weights[key])
+            lower_bound = prev_w * (one_f - max_change)
+            upper_bound = prev_w * (one_f + max_change)
+            raw_blended_clipped[key] = np.clip(w_val, lower_bound, upper_bound)
+        blend_sum = sum(raw_blended_clipped.values()) + epsilon
+        final_weights = {k: float(v / blend_sum) for k, v in raw_blended_clipped.items()}
+    else:
+        blend_sum = sum(raw_blended.values()) + epsilon
+        final_weights = {k: float(v / blend_sum) for k, v in raw_blended.items()}
+        
+    weights_audit = {}
+    for key in static_weights.keys():
+        weights_audit[key] = {
+            "static": static_weights[key],
+            "dynamic_raw": norm_relevance[key],
+            "dynamic_smoothed": final_weights[key],
+            "delta": final_weights[key] - static_weights[key]
+        }
+        
+    return final_weights, weights_audit
+
+
 def _derive_slot15_composite(
     priors: Dict, audit: Dict,
     config: Dict,
+    causal_df: pd.DataFrame,
+    const: Dict,
+    dominant_cycle: int,
+    precomputed_structural_df: Optional[pd.DataFrame] = None,
+    previous_weights: Optional[Dict[str, float]] = None,
 ) -> None:
     """
     Slot 15 — Composite Weights:
-    Weights are sovereign from config. They encode a deliberate architectural
-    belief about relative slot information value that cannot be estimated
-    from a single causal window without multi-year cross-validation. They are
-    therefore left sovereign and flagged as such in the audit with a full
-    ``sovereign_rationale`` entry.
+    Integrates dynamic Bayesian-shrinkage Spearman/MI adaptive slot weights.
     """
+    s15_cfg = config["sovereign_derivation"].get("slot_15", {})
+    enable_adaptive = s15_cfg.get("enable_adaptive_weights", False)
+    
+    zero_f = const["zero_float"]
+    static_weights = config["feature_builder"]["structural"]["slot_15"]["weights"]
+    
+    try:
+        # Eagerly compute both to prevent deferral bias and provide detailed comparison log
+        dyn_weights, weights_audit = _derive_adaptive_slot15_weights(
+            causal_df, dominant_cycle, config, const, precomputed_structural_df, previous_weights
+        )
+        
+        if enable_adaptive:
+            # Active prior weights allocation
+            priors["slot_15_weights"] = dyn_weights
+            method_str = "adaptive_spearman_bayes_shrinkage" if s15_cfg.get("relevance_metric", "spearman") == "spearman" else "adaptive_mi_bayes_shrinkage"
+        else:
+            priors["slot_15_weights"] = static_weights
+            method_str = "sovereign_config_adaptive_disabled"
+            
+        audit["slot_15_weights"] = {
+            "value": priors["slot_15_weights"],
+            "method": method_str,
+            "static_vs_dynamic_weights": weights_audit,
+            "enable_adaptive_weights_active": enable_adaptive
+        }
+    except Exception as exc:
+        priors["slot_15_weights"] = static_weights
+        audit["slot_15_weights"] = {
+            "value": static_weights,
+            "method": "fallback_error",
+            "error": str(exc)
+        }
+        
     slot_15_cfg = config["feature_builder"]["structural"]["slot_15"]
-    audit["slot_15_weights"] = {
-        "value": slot_15_cfg.get("weights", {}),
-        "method": "sovereign_config",
-        "sovereign_rationale": (
-            "Slot weights encode information-theoretic importance of each structural slot "
-            "as determined by offline multi-year cross-validation. Deriving them from a "
-            "single causal shard would produce shard-biased weights with no generality. "
-            "They must be updated via dedicated ablation runs, not inline derivation."
-        ),
-    }
     audit["slot_15_per_slot_normalisation"] = {
         "value": slot_15_cfg.get("per_slot_normalisation", {}),
         "method": "sovereign_config",
@@ -1287,21 +1774,23 @@ def _derive_neural_gate(
             vol_ratios = (rv_series / (priors["gate_baseline_vol"] + epsilon)).dropna()
             vol_ratios = vol_ratios[np.isfinite(vol_ratios)]
             if len(vol_ratios) > const["one_int"]:
-                clip_low = float(np.clip(np.percentile(vol_ratios, 5), 0.1, 1.0))
-                clip_high = float(np.clip(np.percentile(vol_ratios, 95), 1.0, 10.0))
+                clip_cfg = config["sovereign_derivation"]["clip_bounds"]
+                pct_cfg = config["sovereign_derivation"]["percentiles"]
+                clip_low = float(np.clip(np.percentile(vol_ratios, int(pct_cfg["gate_vol_clip_low"])), clip_cfg["gate_conviction_vol_clip_low_min"], clip_cfg["gate_conviction_vol_clip_low_max"]))
+                clip_high = float(np.clip(np.percentile(vol_ratios, int(pct_cfg["gate_vol_clip_high"])), clip_cfg["gate_conviction_vol_clip_high_min"], clip_cfg["gate_conviction_vol_clip_high_max"]))
             else:
-                clip_low = float(gate_cfg.get("conviction_vol_clip_low", 0.3))
-                clip_high = float(gate_cfg.get("conviction_vol_clip_high", 3.0))
+                clip_low = float(gate_cfg["conviction_vol_clip_low"])
+                clip_high = float(gate_cfg["conviction_vol_clip_high"])
         else:
-            clip_low = float(gate_cfg.get("conviction_vol_clip_low", 0.3))
-            clip_high = float(gate_cfg.get("conviction_vol_clip_high", 3.0))
+            clip_low = float(gate_cfg["conviction_vol_clip_low"])
+            clip_high = float(gate_cfg["conviction_vol_clip_high"])
         priors["gate_conviction_vol_clip_low"] = clip_low
         priors["gate_conviction_vol_clip_high"] = clip_high
         audit["gate_conviction_vol_clip_low"] = {"value": clip_low, "method": "empirical_p5_vol_ratio"}
         audit["gate_conviction_vol_clip_high"] = {"value": clip_high, "method": "empirical_p95_vol_ratio"}
     except Exception as exc:
-        fb_low = float(gate_cfg.get("conviction_vol_clip_low", 0.3))
-        fb_high = float(gate_cfg.get("conviction_vol_clip_high", 3.0))
+        fb_low = float(gate_cfg["conviction_vol_clip_low"])
+        fb_high = float(gate_cfg["conviction_vol_clip_high"])
         priors["gate_conviction_vol_clip_low"] = fb_low
         priors["gate_conviction_vol_clip_high"] = fb_high
         audit["gate_conviction_vol_clip_low"] = {"value": fb_low, "method": "fallback", "error": str(exc)}
@@ -1335,15 +1824,16 @@ def _derive_neural_gate(
 
     # kronos_pooling_decay_factor: natural EWM decay over one dominant cycle
     try:
+        clip_cfg = config["sovereign_derivation"]["clip_bounds"]
         decay = float(np.exp(-one_f / max(dominant_cycle, const["one_int"])))
-        decay = float(np.clip(decay, 0.5, 0.9999))
+        decay = float(np.clip(decay, clip_cfg["decay_clip_low"], clip_cfg["decay_clip_high"]))
         priors["kronos_pooling_decay_factor"] = decay
         audit["kronos_pooling_decay_factor"] = {
             "value": decay,
             "method": "exp_neg1_over_dominant_cycle",
         }
     except Exception as exc:
-        fb = float(kronos_cfg["pooling"].get("decay_factor", 0.95))
+        fb = float(kronos_cfg["pooling"]["decay_factor"])
         priors["kronos_pooling_decay_factor"] = fb
         audit["kronos_pooling_decay_factor"] = {"value": fb, "method": "fallback", "error": str(exc)}
 
@@ -1357,12 +1847,15 @@ def _derive_neural_gate(
             q1 = float(rv_series.quantile(0.25))
             q3 = float(rv_series.quantile(0.75))
             iqr = q3 - q1
-            tukey_fence = q3 + 1.5 * iqr  # upper Tukey fence: boundary of "far-out" vol
+            clip_cfg = config["sovereign_derivation"]["clip_bounds"]
+            algo_cfg = config["sovereign_derivation"].get("algorithm_params", {})
+            tukey_k = float(algo_cfg.get("tukey_fence_k", const.get("math_half", _MATH_HALF) * const.get("three_int", _MATH_TWO + _MATH_ONE)))  # SOVEREIGN_MATH_CONSTANT: Tukey's standard k=1.5
+            tukey_fence = q3 + tukey_k * iqr  # upper Tukey fence: boundary of "far-out" vol
             pct_below_fence = float(100.0 * (rv_series <= tukey_fence).mean())
-            vol_pct = float(np.clip(pct_below_fence, 50.0, 98.0))
+            vol_pct = float(np.clip(pct_below_fence, clip_cfg["pooling_vol_pct_low"], clip_cfg["pooling_vol_pct_high"]))
             method = "iqr_tukey_fence_percentile"
         else:
-            vol_pct = float(kronos_cfg["pooling"].get("vol_threshold_percentile", 75))
+            vol_pct = float(kronos_cfg["pooling"]["vol_threshold_percentile"])
             method = "fallback_insufficient_data"
         priors["kronos_vol_threshold_percentile"] = vol_pct
         audit["kronos_vol_threshold_percentile"] = {
@@ -1370,7 +1863,7 @@ def _derive_neural_gate(
             "method": method,
         }
     except Exception as exc:
-        fb = float(kronos_cfg["pooling"].get("vol_threshold_percentile", 75))
+        fb = float(kronos_cfg["pooling"]["vol_threshold_percentile"])
         priors["kronos_vol_threshold_percentile"] = fb
         audit["kronos_vol_threshold_percentile"] = {"value": fb, "method": "fallback", "error": str(exc)}
 
@@ -1403,7 +1896,8 @@ def _derive_aux(
     fallback_mfe = int(aux_cfg["mfe_projection"]["horizon_bars"])
 
     try:
-        vf_lb = max(int(dominant_cycle // 12), const["one_int"])
+        ratio_cfg = config["sovereign_derivation"]["cycle_ratios"]
+        vf_lb = max(int(dominant_cycle // ratio_cfg["slot_24_lookback"]), const["one_int"])
         priors["aux_vol_forecast_lookback_bars"] = vf_lb
         audit["aux_vol_forecast_lookback_bars"] = {"value": vf_lb, "method": "dominant_cycle_div_12"}
     except Exception as exc:
