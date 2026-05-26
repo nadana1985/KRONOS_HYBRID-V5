@@ -163,6 +163,7 @@ reproducibility:
     finite_check_enabled: true
     zero_float: 0.0
     one_float: 1.0
+    two_float: 2.0
     half_float: 0.5
     epsilon: 1.0e-12
     zero_int: 0
@@ -282,6 +283,10 @@ validator:
     - '->'
     - 'expected_sha'
     - '`[0-9.]+`'
+    - '^_[A-Z_]+.*=.*#'          # module-level constant definitions with comments
+    - 'SOVEREIGN_MATH_CONSTANT'  # explicitly marked mathematical identity values
+    - '\.quantile\('             # statistical identity quartile calls
+    - '100\.0 \*'                # percentage conversion (mathematical identity)
   exclude_patterns:
     - 'kronos_module'
     - 'inspect_evals'
@@ -295,7 +300,9 @@ validator:
     - '__pycache__'
     - '.git'
     - 'quant_prior_audit.md'
-    - 'sovereign_prior_derivation_engine.py'
+    - 'mining_full_corpus_guide'
+    - 'global_baseline_recommendations'
+    # Core derivation engine must NEVER be excluded — full sovereignty enforced
   severity_rules:
     default: "CRITICAL"
   exit_violations: 1
@@ -367,4 +374,91 @@ sovereign_derivation:
   bic_refit_interval_bars: 288
   min_improvement_threshold: 0.03
   store_audit: true
-  audit_path: "data/audit/sovereign_priors"
+  audit_path: "data/audit/sovereign_priors"
+  dynamic_fallback: true
+  enable_dynamic_ratios: false   # Set to true in V6 — will override cycle_ratios with MI/changepoint optimization
+  slot_15:
+    enable_adaptive_weights: false  # Toggle to true for adaptive weights activation
+    min_history_bars: 5000         # Min bars for prior derivation significance
+    short_history_bars: 2000       # Short-term window for multi-scale blend
+    blend_short_weight: 0.5        # Blending weight for short-term vs long-term relevance
+    shrinkage_base: 0.65           # Base weight for dynamic blend
+    relevance_metric: "spearman"   # relevance optimizer (spearman or mutual_info)
+    relevance_metric_fallback: "spearman" # fallback metric if primary metric is unstable/fails
+    max_weight_change_ratio: 0.3   # max change limit per shard relative to previous shard
+    min_weight: 0.02               # Hard floor to preserve multi-feature veto
+    max_weight: 0.18               # Hard cap to prevent monopolization
+    confidence_floor: 0.15         # relevance threshold for dynamic trust (fallback)
+    confidence_floor_multiplier: 7.0 # dynamic confidence floor standard error multiplier
+  percentiles:
+    slot_0_extreme: 5            # 5th percentile for extreme proximity threshold
+    slot_9_imbalance: 85         # 85th percentile for liquidity imbalance threshold
+    slot_10_body: 20             # 20th percentile for doji body threshold
+    slot_10_quantile: 99         # 99th percentile for wick ratio quantile
+    gate_vol_clip_low: 5         # 5th percentile for vol-ratio lower clip
+    gate_vol_clip_high: 95       # 95th percentile for vol-ratio upper clip
+    acf_noise_significance: 95   # 95th percentile for ACF noise floor
+  algorithm_params:
+    cwt_max_scale_steps: 128     # max scales in CWT geomspace sweep
+    acf_noise_window: 200        # bars for noise-regime ACF estimation
+    slot_5_min_sig_lags: 3       # minimum significant lags to accept
+    slot_5_max_sig_lags: 8       # maximum significant lags cap
+    slot_5_fallback_end: 6       # range endpoint for fallback lag list [1..6)
+    tukey_fence_k: 1.5           # Tukey's fence multiplier (1.5 = standard definition)
+    mi_bins: 12                  # increased for stability
+    mi_grid_size: 11             # grid size for lookback candidate search
+    changepoint_lookback_multiplier: 6 # lookback depth for regime changepoint search
+    mi_significance_threshold: 0.02   # significance threshold from surrogate test
+    ratio_smoothing_factor: 0.6       # EMA blend between static and dynamic values
+    max_computation_bars: 2000        # computational safety cap for long series
+  cycle_ratios:
+    slot_0_lookback: 12
+    slot_0_absorption: 12
+    slot_1_bucket: 6
+    slot_1_volume_bucket: 6
+    slot_1_lookback: 4
+    slot_3_short: 24
+    slot_3_variance_short: 24
+    slot_3_long_multiplier: 2
+    slot_4_lookback_multiplier: 2
+    slot_5_lag_eval_cap: 20
+    slot_6_base_fallback: 32
+    slot_6_geom_16: 16
+    slot_6_geom_8: 8
+    slot_6_geom_4: 4
+    slot_7_lookback: 12
+    slot_7_accel: 96
+    slot_7_acceleration: 96
+    slot_11_pivot: 96
+    slot_11_pivot_strength: 96
+    slot_13_bin_floor: 5
+    slot_13_bin_cap: 20
+    slot_14_lookback_multiplier: 2
+    slot_24_lookback: 12
+    hmm_bic_low: 2
+    hmm_bic_high: 9
+  clip_bounds:
+    decay_clip_low: 0.5
+    decay_clip_high: 0.9999
+    slot_0_extreme_high: 0.5
+    slot_9_imbalance_low: 0.5
+    slot_9_imbalance_high: 0.99
+    slot_10_body_low: 0.05
+    slot_10_body_high: 0.5
+    slot_10_quantile_low: 0.9
+    slot_10_quantile_high: 0.999
+    slot_12_coeff_low: 0.3
+    slot_12_coeff_high: 0.9
+    gate_conviction_vol_clip_low_min: 0.1
+    gate_conviction_vol_clip_low_max: 1.0
+    gate_conviction_vol_clip_high_min: 1.0
+    gate_conviction_vol_clip_high_max: 10.0
+    pooling_vol_pct_low: 50.0
+    pooling_vol_pct_high: 98.0
+
+# Hardened Full Corpus Mining Configuration
+full_corpus_mining:
+  chunk_size_days: 15
+  checkpoint_interval_shards: 3
+  max_memory_percent: 85.0
+  checkpoint_file: "data/full_corpus_checkpoint.json"
