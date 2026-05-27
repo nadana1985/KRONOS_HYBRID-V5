@@ -1,14 +1,23 @@
 """
 KRONOS Feature Builder Engine
 ================================
-Orchestrates the complete causal thirty-two-slot DNA vector pipeline:
-  raw_candles + agg_trades
-    → causal slice (iloc[:t + one_int])
-    → structural_engine.compute_slots_sovereign(...)
-    → veto composite
-    → neural gate (if veto passes and kronos enabled)
-    → aux slots + metadata slots
-    → full DNA vector assembly
+Orchestrates the complete causal thirty-two-slot DNA vector pipeline.
+
+==============================================================================
+NEURAL ALWAYS ATTEMPTED, NEVER BLOCKING DOCTRINE
+==============================================================================
+1. STRUCTURAL ABSOLUTE FLOOR: The signature_flag is controlled exclusively by
+   structural_engine.compute_veto_composite (veto_passed). If structural veto
+   passes, the signature is mathematically valid and MUST be mined.
+2. NEURAL ORTHOGONAL AMPLIFICATION: The Kronos-mini neural gate (transformer) is
+   strictly non-blocking. It acts as a conviction amplifier, populates Slots
+   16-23 (embeddings), and scales signature_quality, but it has ZERO power to
+   block or veto a signature.
+3. BEST-EFFORT EXECUTION: Neural gate evaluations are always attempted on a
+   best-effort basis. If model loading fails (missing libraries, weight errors,
+   GPU issues), the pipeline falls back gracefully to pure structural metrics
+   without silencing signature mining.
+==============================================================================
 
 ALL parameters resolve exclusively from cfg dicts. No inline literals.
 """
@@ -80,26 +89,44 @@ def build_full_dna_vector(
     dynamic_threshold = zero_f
     neural_passed = False
     pooled_emb = np.zeros(emb_dim, dtype=np.float32)
+    neural_available = False
 
     if veto_passed and enable_kronos:
-        import neural_integration_engine
-        neural_conviction, dynamic_threshold, neural_passed, pooled_emb = (
-            neural_integration_engine.compute_neural_gate(
-                causal_candles,
-                current_idx,
-                recent_convictions,
-                config["kronos_mini"],
-                config["feature_builder"]["gate"],
-                const,
+        try:
+            import neural_integration_engine
+            neural_conviction, dynamic_threshold, neural_passed, pooled_emb, neural_available = (
+                neural_integration_engine.compute_neural_gate(
+                    causal_candles,
+                    current_idx,
+                    recent_convictions,
+                    config["kronos_mini"],
+                    config["feature_builder"]["gate"],
+                    const,
+                )
             )
-        )
+        except Exception as exc:
+            import warnings
+            warnings.warn(
+                f"Failed to execute neural gate in feature builder: {exc}. Gracefully degrading to baseline structural conviction.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            neural_available = False
 
     # ── SIGNATURE FLAG ────────────────────────────────────────────────────
     flag_key = config["feature_builder"]["gate"]["signature_flag_key"]
     conv_key = config["feature_builder"]["gate"]["neural_conviction_key"]
     thresh_key = config["feature_builder"]["gate"]["conviction_threshold_key"]
     veto_key = config["feature_builder"]["structural"]["slot_15"]["key_name"]
-    signature_flag = veto_passed and (neural_passed or not enable_kronos)
+    
+    signature_flag = veto_passed  # ← SOVEREIGN RULE: Structural veto is the absolute floor. Neural is strictly orthogonal.
+
+    # [NEURAL] Model Status logging
+    status_str = "MINED" if signature_flag else "DISCARDED"
+    print(
+        f"[NEURAL] Model Status: {neural_available} | Conviction: {neural_conviction:.6f} | "
+        f"Structural Veto: {current_veto_score:.4f} | Final Flag: {signature_flag} -> {status_str}"
+    )
 
     # ── AUXILIARY SLOTS ───────────────────────────────────────────────────
     aux_row = _compute_aux_slots(
@@ -110,7 +137,8 @@ def build_full_dna_vector(
 
     # ── METADATA SLOTS ────────────────────────────────────────────────────
     meta_row = _compute_metadata_slots(
-        current_veto_score, neural_conviction, config, causal_candles
+        current_veto_score, neural_conviction, config, causal_candles,
+        neural_available=neural_available
     )
 
     # ── ASSEMBLY ──────────────────────────────────────────────────────────
@@ -266,6 +294,7 @@ def _compute_metadata_slots(
     neural_conviction: float,
     config: Dict,
     causal_candles: pd.DataFrame,
+    neural_available: bool = False,
 ) -> Dict:
     """
     Computes metadata slots: phylum placeholder, timestamp hash,
@@ -297,9 +326,13 @@ def _compute_metadata_slots(
         min(veto_score * neural_conviction / (one_f + epsilon), one_f)
     )
 
-    # Signature quality: mean of veto and conviction
-    result[keys["signature_quality"]] = float(
-        (veto_score + neural_conviction) / float(const["two_int"])
-    )
+    # Signature quality: mean of veto and conviction when neural active and loaded (bonus multiplier, no drag), otherwise pure structural veto
+    enable_kronos = config["miner"].get("enable_kronos", True)
+    if enable_kronos and neural_available:
+        result[keys["signature_quality"]] = float(
+            max(veto_score, (veto_score + neural_conviction) / float(const["two_int"]))
+        )
+    else:
+        result[keys["signature_quality"]] = float(veto_score)  # Pure structural when neural unavailable
 
     return result

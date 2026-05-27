@@ -259,13 +259,14 @@ def compile_global_ontology(symbol: str, config: Dict[str, Any]) -> None:
             return
 
         # Memory guard to protect against system crashes on extremely large data slices
-        max_rows = config["miner"].get("max_ontology_rows", 50000)
+        max_rows = config.get("full_corpus_mining", {}).get("max_ontology_rows", config["miner"].get("max_ontology_rows", const["fifty_thousand_int"]))
         if len(sig_df) > max_rows:
             logger.warning(
                 f"[ONTOLOGY] Memory guard triggered: {len(sig_df):,} signatures exceeds "
                 f"max_ontology_rows ({max_rows}). Downsampling to prevent memory exhaustion."
             )
-            sig_df = sig_df.sample(n=max_rows, random_state=int(const["seed"])).sort_index()
+            seed_val = int(config["reproducibility"].get("random_seed", 42))
+            sig_df = sig_df.sample(n=max_rows, random_state=seed_val).sort_index()
 
         feature_matrix = sig_df[available_cols].fillna(zero_f).values
         logger.info(f"[ONTOLOGY] Running post-hoc clustering on matrix of size: {feature_matrix.shape}")

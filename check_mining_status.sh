@@ -3,7 +3,7 @@
 # KRONOS HYBRID — Full Mining Intelligence Report
 # =============================================================================
 # Covers:
-#   1. Shard progress (14 shards in L4 — why is mining slow?)
+#   1. Shard progress (158 shards in full corpus — 15-day blocks)
 #   2. ETA to completion
 #   3. Signatures found so far
 #   4. Full 32-slot audit (values + zero-value detection)
@@ -11,7 +11,7 @@
 # =============================================================================
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-CHECKPOINT_FILE="$REPO_DIR/data/shard_checkpoint.json"
+CHECKPOINT_FILE="$REPO_DIR/data/full_corpus_checkpoint.json"
 COMPACT_FILE="$REPO_DIR/data/signatures_compact.parquet"
 SIG_DIR="$REPO_DIR/data/signatures"
 
@@ -33,7 +33,7 @@ python3 - <<'PYEOF'
 import json, os, glob, time, datetime
 from pathlib import Path
 
-checkpoint_file = "data/shard_checkpoint.json"
+checkpoint_file = "data/full_corpus_checkpoint.json"
 sig_dir         = "data/signatures"
 compact_file    = "data/signatures_compact.parquet"
 
@@ -46,7 +46,7 @@ if os.path.exists(checkpoint_file):
     except Exception as e:
         print(f"  [WARN] Could not read checkpoint: {e}")
 
-total_shards  = 14   # L4 = 14 shards
+total_shards  = 158  # full corpus = 158 x 15-day shards
 done          = len(completed)
 remaining     = total_shards - done
 pct           = (done / total_shards * 100) if total_shards else 0

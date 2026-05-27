@@ -1,8 +1,19 @@
 # KRONOS V5 Hybrid Sovereign Engine — params_yaml.txt
 # ==============================================================================
+# KRONOS SOVEREIGNTY PRIORITY HIERARCHY
+# ======================================
+# 1. STRICT CAUSAL DATA INGESTION: Historical OHLCV inputs bounded strictly to [0..t].
+# 2. SOVEREIGN PRIOR DERIVATION ENGINE: In-memory parameter derivation using Continuous
+#    Wavelet Transform (CWT) and Bayesian Information Criterion (BIC) regime classification.
+# 3. STATIC CONFIGURATION DEFAULTS: Parsed parameters loaded from params_yaml.txt act as
+#    authoritative fallbacks when causal historical data is mathematically insufficient.
+# 4. ZERO-LITERAL DOCTRINE: Computational engines must resolve all execution values via
+#    the passed config structure, prohibiting inline constants in source files.
+# ==============================================================================
 # SINGLE SOURCE OF TRUTH. All runtime values live here.
 # Code and specs MUST resolve exclusively via cfg["section"]["key"].
 # ZERO inline literals permitted anywhere else.
+# ==============================================================================
 
 feature_builder:
   stride: 1
@@ -206,6 +217,7 @@ reproducibility:
     global_vol_ref_bars: 10000
     context_length: 2048
     hmm_n_iter: 100
+    fifty_thousand_int: 50000
 
 targets:
   min_gross_profit: 9.5
@@ -368,7 +380,7 @@ tokens:
 #   Created automatically if it does not exist.
 
 sovereign_derivation:
-  enabled: true
+  enabled: false
   method: "cwt_bic_empirical"
   frequency: "per_shard"
   bic_refit_interval_bars: 288
@@ -461,6 +473,11 @@ sovereign_derivation:
 # Hardened Full Corpus Mining Configuration
 full_corpus_mining:
   chunk_size_days: 15
+  adaptive_chunk_on_high_mem: true
+  max_memory_percent: 95.0
+  high_memory_percent: 85.0
+  critical_memory_percent: 90.0
+  min_chunk_days: 5
+  max_ontology_rows: 100000
   checkpoint_interval_shards: 3
-  max_memory_percent: 85.0
   checkpoint_file: "data/full_corpus_checkpoint.json"

@@ -33,6 +33,45 @@ _TOKENIZER_CACHE: Dict[str, object] = {}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# INTERNAL SOVEREIGN RESOURCE RESOLUTION
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _resolve_absolute_resource_path(resource_name: str) -> str:
+    """
+    Sovereign Path Resolution Layer.
+    Scans multiple relative and parent fallback paths to find the model/tokenizer directory.
+    Returns the absolute path of the first directory that actually exists.
+    Falls back to root-relative path if none exist.
+    """
+    import os
+    if os.path.isabs(resource_name):
+        return resource_name
+
+    root_dir = os.path.dirname(os.path.abspath(__file__))
+    
+    # Lightning AI Studio base paths
+    cloud_base = "/teamspace/studios/this_studio/kronos"
+
+    # Candidate search list (workspace root, parent root, nested models, and CWD)
+    candidates = [
+        os.path.abspath(os.path.join(root_dir, resource_name)),
+        os.path.abspath(os.path.join(root_dir, "..", resource_name)),
+        os.path.abspath(os.path.join(root_dir, "kronos_module", "models", os.path.basename(resource_name))),
+        os.path.abspath(os.path.join(cloud_base, resource_name)),
+        os.path.abspath(os.path.join(cloud_base, "kronos_module", "models", os.path.basename(resource_name))),
+        os.path.abspath(os.path.join(cloud_base, "models", os.path.basename(resource_name))),
+        os.path.abspath(os.path.join(cloud_base, os.path.basename(resource_name))),
+        os.path.abspath(os.path.join(os.getcwd(), resource_name)),
+    ]
+    
+    for cand in candidates:
+        if os.path.isdir(cand):
+            return cand
+            
+    return os.path.abspath(os.path.join(root_dir, resource_name))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # PUBLIC API — LOAD & VERIFY
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -55,19 +94,39 @@ def load_verified_model(config: Dict) -> object:
         import sys
         import os
 
-        # Add kronos_module to path to allow importing from model
+        # Dynamically locate and prepend the active kronos_module directory to sys.path
         current_dir = os.path.dirname(os.path.abspath(__file__))
-        kronos_module_path = os.path.join(current_dir, "kronos_module")
-        if kronos_module_path not in sys.path:
-            sys.path.insert(0, kronos_module_path)
+        absolute_path = _resolve_absolute_resource_path(model_name)
+        
+        module_candidates = [
+            os.path.join(current_dir, "kronos_module"),
+            "/teamspace/studios/this_studio/kronos/kronos_module",
+        ]
+        
+        try:
+            parts = Path(absolute_path).parts
+            if "kronos_module" in parts:
+                idx = parts.index("kronos_module")
+                module_candidates.append(str(Path(*parts[:idx+1])))
+        except Exception:
+            pass
+            
+        for mc in module_candidates:
+            if os.path.isdir(mc):
+                abs_mc = os.path.abspath(mc)
+                if abs_mc not in sys.path:
+                    sys.path.insert(0, abs_mc)
 
         from model import Kronos
 
         precision_str = repro_cfg["precision"]
         dtype = _resolve_dtype(precision_str)
 
+        # Anchor relative paths dynamically for absolute CWD independence via Sovereign Path Resolver
+        absolute_path = _resolve_absolute_resource_path(model_name)
+
         # PyTorchModelHubMixin from_pretrained handles local directories beautifully
-        model = Kronos.from_pretrained(model_name, local_files_only=True)
+        model = Kronos.from_pretrained(absolute_path, local_files_only=True)
         
         if dtype is not None:
             model = model.to(dtype)
@@ -118,15 +177,35 @@ def load_verified_tokenizer(config: Dict) -> object:
         import sys
         import os
 
-        # Add kronos_module to path to allow importing from model
+        # Dynamically locate and prepend the active kronos_module directory to sys.path
         current_dir = os.path.dirname(os.path.abspath(__file__))
-        kronos_module_path = os.path.join(current_dir, "kronos_module")
-        if kronos_module_path not in sys.path:
-            sys.path.insert(0, kronos_module_path)
+        absolute_path = _resolve_absolute_resource_path(tok_name)
+        
+        module_candidates = [
+            os.path.join(current_dir, "kronos_module"),
+            "/teamspace/studios/this_studio/kronos/kronos_module",
+        ]
+        
+        try:
+            parts = Path(absolute_path).parts
+            if "kronos_module" in parts:
+                idx = parts.index("kronos_module")
+                module_candidates.append(str(Path(*parts[:idx+1])))
+        except Exception:
+            pass
+            
+        for mc in module_candidates:
+            if os.path.isdir(mc):
+                abs_mc = os.path.abspath(mc)
+                if abs_mc not in sys.path:
+                    sys.path.insert(0, abs_mc)
 
         from model import KronosTokenizer
 
-        tokenizer = KronosTokenizer.from_pretrained(tok_name, local_files_only=True)
+        # Anchor relative paths dynamically for absolute CWD independence via Sovereign Path Resolver
+        absolute_path = _resolve_absolute_resource_path(tok_name)
+
+        tokenizer = KronosTokenizer.from_pretrained(absolute_path, local_files_only=True)
         
         # Move tokenizer parameters to CUDA device if GPU execution is active and available
         device = "cuda" if (torch.cuda.is_available() and config["feature_builder"].get("use_gpu", True)) else "cpu"
@@ -335,12 +414,12 @@ def compute_neural_gate(
     kronos_cfg: Dict,
     gate_cfg: Dict,
     const: Dict,
-) -> Tuple[float, float, bool, np.ndarray]:
+) -> Tuple[float, float, bool, np.ndarray, bool]:
     """
     Full neural gate pipeline for one bar.
 
     Returns:
-        (conviction_score, dynamic_threshold_value, neural_passed, pooled_embedding)
+        (conviction_score, dynamic_threshold_value, neural_passed, pooled_embedding, neural_available)
     """
     full_cfg = {
         "kronos_mini": kronos_cfg,
@@ -350,37 +429,54 @@ def compute_neural_gate(
     zero_f = const["zero_float"]
     one_i = const["one_int"]
     zero_i = const["zero_int"]
+    emb_dim = kronos_cfg["embedding_dim"]
+    zero_emb = np.full(emb_dim, zero_f, dtype=np.float32)
 
-    model = load_verified_model(full_cfg)
-    tokenizer = load_verified_tokenizer(full_cfg)
+    try:
+        model = load_verified_model(full_cfg)
+        tokenizer = load_verified_tokenizer(full_cfg)
+        neural_available = (model is not None and tokenizer is not None)
 
-    embedding = extract_embeddings(causal_candles, current_idx, model, tokenizer, full_cfg)
-    conviction = compute_lp_norm(embedding, full_cfg)
+        if not neural_available:
+            floor_val = gate_cfg.get("min_conviction_floor", 0.05)
+            return float(floor_val), float(zero_f), False, zero_emb, False
 
-    # Volatility computation for conviction threshold scaling (computed from full causal history)
-    close_series = pd.Series(causal_candles["close"].values)
-    prev_close = close_series.shift(one_i).fillna(close_series.iloc[zero_i])
-    epsilon = const["epsilon"]
-    log_ret = np.log((close_series.values + epsilon) / (prev_close.values + epsilon))
-    current_vol = float(np.std(log_ret))
+        embedding = extract_embeddings(causal_candles, current_idx, model, tokenizer, full_cfg)
+        conviction = compute_lp_norm(embedding, full_cfg)
 
-    # Resolve timestamp
-    if "datetime" in causal_candles.columns:
-        current_timestamp = causal_candles["datetime"].iloc[current_idx]
-    else:
-        current_timestamp = causal_candles.index[current_idx]
-    if not isinstance(current_timestamp, pd.Timestamp):
-        current_timestamp = pd.Timestamp(current_timestamp)
+        # Volatility computation for conviction threshold scaling (computed from full causal history)
+        close_series = pd.Series(causal_candles["close"].values)
+        prev_close = close_series.shift(one_i).fillna(close_series.iloc[zero_i])
+        epsilon = const["epsilon"]
+        log_ret = np.log((close_series.values + epsilon) / (prev_close.values + epsilon))
+        current_vol = float(np.std(log_ret))
 
-    threshold = dynamic_threshold(
-        recent_convictions,
-        full_cfg,
-        current_timestamp=current_timestamp,
-        current_vol=current_vol,
-    )
-    neural_passed = conviction > threshold
+        # Resolve timestamp
+        if "datetime" in causal_candles.columns:
+            current_timestamp = causal_candles["datetime"].iloc[current_idx]
+        else:
+            current_timestamp = causal_candles.index[current_idx]
+        if not isinstance(current_timestamp, pd.Timestamp):
+            current_timestamp = pd.Timestamp(current_timestamp)
 
-    return float(conviction), float(threshold), bool(neural_passed), embedding
+        threshold = dynamic_threshold(
+            recent_convictions,
+            full_cfg,
+            current_timestamp=current_timestamp,
+            current_vol=current_vol,
+        )
+        neural_passed = conviction > threshold
+
+        return float(conviction), float(threshold), bool(neural_passed), embedding, True
+
+    except Exception as exc:
+        warnings.warn(
+            f"Exception inside compute_neural_gate: {exc}. Gracefully degrading to baseline structural conviction.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        floor_val = gate_cfg.get("min_conviction_floor", 0.05)
+        return float(floor_val), float(zero_f), False, zero_emb, False
 
 
 # ─────────────────────────────────────────────────────────────────────────────

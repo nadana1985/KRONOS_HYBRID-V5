@@ -63,7 +63,8 @@ SETUP COMPLETE. KRONOS HYBRID is ready to mine.
 bash start_mining.sh
 ```
 
-This launches `run_sharded_pipeline.py` inside a **tmux** session called `kronos_mining`.  
+This launches `run_full_corpus_mining.py` inside a **tmux** session called `kronos_mining`.  
+Mines the **full ETH corpus (2019 → present)** across 158 × 15-day shards.  
 The run will **survive disconnects** — you can close your browser and it keeps running.
 
 ---

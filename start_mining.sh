@@ -2,7 +2,7 @@
 # =============================================================================
 # KRONOS HYBRID — Headless Mining Launcher for Lightning AI L4
 # =============================================================================
-# Starts run_sharded_pipeline.py in a tmux session so it survives disconnects.
+# Starts run_full_corpus_mining.py in a tmux session so it survives disconnects.
 # Usage: bash start_mining.sh
 # Monitor: bash monitor_mining.sh
 # =============================================================================
@@ -11,7 +11,7 @@ set -euo pipefail
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SESSION="kronos_mining"
 LOG_FILE="$REPO_DIR/logs/mining_$(date +%Y%m%d_%H%M%S).log"
-CHECKPOINT_FILE="$REPO_DIR/data/shard_checkpoint.json"
+CHECKPOINT_FILE="$REPO_DIR/data/full_corpus_checkpoint.json"
 
 mkdir -p "$REPO_DIR/logs"
 
@@ -49,7 +49,7 @@ tmux new-session -d -s "$SESSION" -x 220 -y 50
 sleep 2
 
 # Send the mining command into the tmux session
-tmux send-keys -t "$SESSION" "cd $REPO_DIR && python3 run_sharded_pipeline.py 2>&1 | tee $LOG_FILE" Enter
+tmux send-keys -t "$SESSION" "cd $REPO_DIR && python3 run_full_corpus_mining.py params_yaml.txt 2>&1 | tee $LOG_FILE" Enter
 
 echo ""
 echo "================================================================"

@@ -16,6 +16,7 @@ import hashlib
 from pathlib import Path
 import pandas as pd
 import numpy as np
+from typing import Optional
 
 # Core quant engines
 from load_sovereign_config import load_sovereign_config
@@ -107,11 +108,11 @@ def _run_shard(shard_start: str, shard_end: str, base_config: dict, bic_cache: O
 
     # Sovereign prior derivation (Locked static priors: enable_dynamic_ratios=false, enable_adaptive_weights=false)
     for symbol in config["miner"]["symbols"]:
-        raw_candles, _ = data_engine.load_shard_data(symbol, config)
-        if raw_candles is not None and len(raw_candles) > const["zero_int"]:
+        causal_only_candles, _ = data_engine.load_shard_data_causal_only(symbol, config)
+        if causal_only_candles is not None and len(causal_only_candles) > const["zero_int"]:
             # Isolate cache per symbol to prevent concurrency side-effects
             sym_cache = bic_cache.setdefault(symbol, {}) if bic_cache is not None else {}
-            sovereign_priors = _sov_deriv.derive_sovereign_priors(raw_candles, config, bic_cache=sym_cache)
+            sovereign_priors = _sov_deriv.derive_sovereign_priors(causal_only_candles, config, bic_cache=sym_cache)
             _audit = sovereign_priors.get("_audit", {})
 
             if not _audit.get("_disabled", False):
@@ -141,6 +142,14 @@ def _run_shard(shard_start: str, shard_end: str, base_config: dict, bic_cache: O
                     with open(audit_dir / filename, "w") as fh:
                         json.dump(_serialise(sovereign_priors), fh, indent=2, default=str)  # SOVEREIGN_MATH_CONSTANT
             break  # derive once per shard
+
+    # Post-prior-derivation memory cleanup
+    import gc
+    gc.collect()
+    if "torch" in sys.modules:
+        import torch
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     # Walk-forward bar-by-bar mining
     _mine_shard_only(config)
@@ -219,6 +228,80 @@ def _mine_shard_only(config: dict) -> None:
 
             is_first_shard = False
 
+    # Post-shard cleanup to free memory
+    import gc
+    gc.collect()
+    if "torch" in sys.modules:
+        import torch
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+
+def get_corpus_date_bounds(raw_path: str) -> tuple[str, str, int]:
+    """Retrieves datetime bounds and row count using PyArrow metadata to avoid materializing dataframes in RAM."""
+    import pyarrow.parquet as pq
+    import pandas as pd
+    meta = pq.read_metadata(raw_path)
+    num_rows = meta.num_rows
+    
+    # Read only the datetime column to resolve the min/max dates
+    dates_table = pq.read_table(raw_path, columns=["datetime"])
+    datetime_series = pd.to_datetime(dates_table.column("datetime").to_pandas())
+    
+    min_date = datetime_series.min().strftime("%Y-%m-%d %H:%M:%S")
+    max_date = datetime_series.max().strftime("%Y-%m-%d %H:%M:%S")
+    return min_date, max_date, num_rows
+
+
+def run_post_run_protocol(config: dict) -> None:
+    """Executes the post-run automation step to compact, compile, and refresh."""
+    import os
+    import sys
+    import miner_engine
+    import database_engine
+    print("\n=========================================")
+    print("MANDATORY POST-RUN OPTIMIZATION PROTOCOL")
+    print("=========================================")
+    try:
+        sys.path.append(os.path.join(os.path.dirname(__file__), "scratch"))
+        
+        # Step 1: Compactor
+        try:
+            from compact_database import compact_database
+            print("[POST] Step 1/4 — Compacting partition tree...")
+            compact_database()
+        except Exception as e:
+            print(f"[WARNING] Step 1/4 (Compactor) failed: {e}")
+        
+        # Step 2: Stable Ontology Compilation
+        try:
+            print("[POST] Step 2/4 — Global Ontology Compilation (slot_28)...")
+            for symbol in config["miner"]["symbols"]:
+                miner_engine.compile_global_ontology(symbol, config)
+        except Exception as e:
+            print(f"[WARNING] Step 2/4 (Ontology) failed: {e}")
+            
+        # Step 3: Refresh DuckDB View
+        try:
+            print("[POST] Step 3/4 — Refreshing DuckDB views...")
+            database_engine.initialize_duckdb_views(config)
+        except Exception as e:
+            print(f"[WARNING] Step 3/4 (DuckDB) failed: {e}")
+        
+        # Step 4: Signatures Wiki
+        try:
+            from generate_signatures_wiki import generate_wiki
+            print("[POST] Step 4/4 — Compiling signature database wiki...")
+            generate_wiki()
+        except Exception as e:
+            print(f"[WARNING] Step 4/4 (Wiki) failed: {e}")
+            
+        print("[POST] Post-run optimization completed successfully!")
+    except Exception as e:
+        print(f"[WARNING] Post-run optimization failed: {e}")
+        
+    print("=========================================\n")
+
 
 def main():
     print("=== KRONOS HARDENED FULL CORPUS MINING ENGINE ===")
@@ -247,12 +330,8 @@ def main():
         sys.exit(config["validator"]["exit_usage_error"])
         
     print(f"[DATA] Scanning historical bounds from: {raw_path}")
-    raw_df = pd.read_parquet(raw_path)
-    raw_df["datetime"] = pd.to_datetime(raw_df["datetime"])
-    
-    min_date = raw_df["datetime"].min().strftime("%Y-%m-%d %H:%M:%S")
-    max_date = raw_df["datetime"].max().strftime("%Y-%m-%d %H:%M:%S")
-    print(f"[DATA] Corpus bounds: {min_date} to {max_date} ({len(raw_df):,} bars)")
+    min_date, max_date, num_rows = get_corpus_date_bounds(raw_path)
+    print(f"[DATA] Corpus bounds: {min_date} to {max_date} ({num_rows:,} bars)")
     
     # Generate 15-day shards (hardened default)
     chunk_days = int(mining_cfg.get("chunk_size_days", 15))  # SOVEREIGN_MATH_CONSTANT
@@ -300,75 +379,98 @@ def main():
     processed_count = const["zero_int"]
     
     local_bic_cache = {}  # SOVEREIGN_MATH_CONSTANT: thread-safe isolated HMM cache
-    for idx, (shard_start, shard_end) in enumerate(shards, 1):
+    
+    current_dt = pd.to_datetime(min_date)
+    max_dt = pd.to_datetime(max_date)
+    
+    default_chunk_days = int(mining_cfg.get("chunk_size_days", 15))
+    min_chunk_days = int(mining_cfg.get("min_chunk_days", 5))
+    adaptive_chunk_enabled = mining_cfg.get("adaptive_chunk_on_high_mem", False)
+    
+    shard_idx = 0
+    while current_dt < max_dt:
+        shard_start = current_dt.strftime("%Y-%m-%d %H:%M:%S")
+        
+        # Check if there is a completed checkpoint starting at this start time
+        prefix = f"{shard_start}_".replace(" ", "_")
+        matching_key = None
+        for k in completed_checkpoints.keys():
+            if k.startswith(prefix):
+                matching_key = k
+                break
+                
+        if matching_key is not None:
+            parts = matching_key.split("_")
+            if len(parts) == 4:
+                shard_end_reconstructed = f"{parts[2]} {parts[3]}"
+                expected_hash = compute_shard_hash(shard_start, shard_end_reconstructed, config_hash, raw_file_hash)
+                stored_hash = completed_checkpoints[matching_key]
+                if stored_hash == expected_hash:
+                    print(f"[CHECKPOINT] Skipping (Verified): {shard_start} to {shard_end_reconstructed}")
+                    current_dt = pd.to_datetime(shard_end_reconstructed)
+                    shard_idx += 1
+                    continue
+                else:
+                    print(f"[WARNING] Cryptographic hash mismatch on shard {matching_key}. Invalidation triggered, re-mining...")
+        
+        # Determine actual chunk size dynamically based on memory pressure
+        chunk_days = default_chunk_days
+        if adaptive_chunk_enabled:
+            mem_pct = get_memory_percent()
+            high_mem_limit = float(mining_cfg.get("high_memory_percent", 75.0))  # SOVEREIGN_MATH_CONSTANT
+            crit_mem_limit = float(mining_cfg.get("critical_memory_percent", 80.0))  # SOVEREIGN_MATH_CONSTANT
+            if mem_pct > crit_mem_limit:
+                chunk_days = min_chunk_days
+                print(f"[ADAPTIVE] Critical memory ({mem_pct:.1f}%) -> reducing chunk size to minimum: {chunk_days} days")
+            elif mem_pct > high_mem_limit:
+                chunk_days = max(min_chunk_days, int(default_chunk_days // 2))
+                print(f"[ADAPTIVE] High memory ({mem_pct:.1f}%) -> reducing chunk size from {default_chunk_days} to {chunk_days} days")
+                
+        nxt_dt = current_dt + pd.Timedelta(days=chunk_days)
+        if nxt_dt > max_dt:
+            nxt_dt = max_dt
+            
+        shard_start = current_dt.strftime("%Y-%m-%d %H:%M:%S")
+        shard_end = nxt_dt.strftime("%Y-%m-%d %H:%M:%S")
         shard_key = f"{shard_start}_{shard_end}".replace(" ", "_")
         expected_hash = compute_shard_hash(shard_start, shard_end, config_hash, raw_file_hash)
+        shard_idx += 1
         
-        # Cryptographic check
-        if shard_key in completed_checkpoints:
-            stored_hash = completed_checkpoints[shard_key]
-            if stored_hash == expected_hash:
-                print(f"[{idx}/{total_shards}] SKIPPING (Verified): {shard_start} to {shard_end}")
-                continue
-            else:
-                print(f"[{idx}/{total_shards}] WARN: Cryptographic hash mismatch on {shard_key}. Invalidation triggered, re-mining...")
-                
         # Perform memory resources pre-flight check
         if not check_resource_guardrails(config):
             print("[FATAL] Halting execution to preserve system integrity. Checkpoints saved.")
             sys.exit(config["validator"]["exit_usage_error"])
             
-        print(f"\n[{idx}/{total_shards}] PROCESSING SHARD: {shard_start} to {shard_end}")
+        print(f"\n[SHARD {shard_idx}] PROCESSING SHARD: {shard_start} to {shard_end}")
         
         try:
             _run_shard(shard_start, shard_end, config, bic_cache=local_bic_cache)
             
             # Save checkpoint atomically
             completed_checkpoints[shard_key] = expected_hash
-            with open(checkpoint_file, "w") as f:
-                json.dump(completed_checkpoints, f, indent=2)  # SOVEREIGN_MATH_CONSTANT
+            tmp_path = checkpoint_file.with_suffix('.tmp')
+            try:
+                with open(tmp_path, "w") as f:
+                    json.dump(completed_checkpoints, f, indent=2)
+                tmp_path.replace(checkpoint_file)  # atomic replacement
+            except Exception as e:
+                tmp_path.unlink(missing_ok=True)
+                raise RuntimeError(f"Checkpoint atomic write failed: {e}")
                 
             processed_count += 1
             if processed_count % checkpoint_interval == const["zero_int"]:
                 print(f"[CHECKPOINT] Cryptographically synchronized state for {processed_count} shards.")
                 
+            current_dt = nxt_dt
+            
         except Exception as e:
             print(f"[CRITICAL ERROR] Failed during shard {shard_start} to {shard_end}: {e}")
+            print("[RECOVERY] Executing post-crash optimization recovery on successfully mined shards...")
+            run_post_run_protocol(config)
             sys.exit(config["validator"]["exit_usage_error"])
             
     print("\n[FINISHED] Chronological sharded sweep completed.")
-    
-    # 7. Post-Run Automation Step
-    print("\n=========================================")
-    print("MANDATORY POST-RUN OPTIMIZATION PROTOCOL")
-    print("=========================================")
-    try:
-        sys.path.append(os.path.join(os.path.dirname(__file__), "scratch"))
-        
-        # Step 1: Compactor
-        from compact_database import compact_database
-        print("[POST] Step 1/4 — Compacting partition tree...")
-        compact_database()
-        
-        # Step 2: Stable Ontology Compilation
-        print("[POST] Step 2/4 — Global Ontology Compilation (slot_28)...")
-        for symbol in config["miner"]["symbols"]:
-            miner_engine.compile_global_ontology(symbol, config)
-            
-        # Step 3: Refresh DuckDB View
-        print("[POST] Step 3/4 — Refreshing DuckDB views...")
-        database_engine.initialize_duckdb_views(config)
-        
-        # Step 4: Signatures Wiki
-        from generate_signatures_wiki import generate_wiki
-        print("[POST] Step 4/4 — Compiling signature database wiki...")
-        generate_wiki()
-        
-        print("[POST] Post-run optimization completed successfully!")
-    except Exception as e:
-        print(f"[WARNING] Post-run optimization failed: {e}")
-        
-    print("=========================================\n")
+    run_post_run_protocol(config)
 
 
 if __name__ == "__main__":

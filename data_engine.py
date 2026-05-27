@@ -284,6 +284,32 @@ def load_shard_data(symbol: str, config: Dict) -> Tuple[pd.DataFrame, pd.DataFra
     return candles, agg
 
 
+def load_shard_data_causal_only(symbol: str, config: Dict) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """Like load_shard_data but with NO warmup prepend — for prior derivation only."""
+    candles = fetch_or_load_ohlcv(config, symbol=symbol)
+    data_cfg = config["data"]
+    start_str = data_cfg.get("fetch_start_date")
+    end_str = _resolve_effective_end_date(config)
+    if start_str and not candles.empty:
+        start_ts = pd.Timestamp(start_str)
+        if start_ts.tz is None:
+            start_ts = start_ts.tz_localize("UTC")
+        end_ts = pd.Timestamp(end_str)
+        if end_ts.tz is None:
+            end_ts = end_ts.tz_localize("UTC")
+        matching = candles[candles["datetime"] >= start_ts].index
+        if len(matching) > 0:
+            start_idx = matching[0]  # NO warmup subtraction
+            end_matching = candles[candles["datetime"] <= end_ts].index
+            end_idx = end_matching[-1] + 1 if len(end_matching) > 0 else len(candles)
+            candles = candles.iloc[start_idx:end_idx].reset_index(drop=True)
+    agg = generate_synthetic_trades(candles, config)
+    if "datetime" in candles.columns:
+        candles["datetime"] = pd.to_datetime(candles["datetime"], utc=True)
+        candles = candles.sort_values("datetime").reset_index(drop=True)
+    return candles, agg
+
+
 def _parse_retry_after_seconds(retry_after_value: str, fallback_seconds: float) -> float:
     """
     Parse HTTP Retry-After header into seconds.

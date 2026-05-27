@@ -254,6 +254,7 @@ def query_conviction_distribution(con, config: Dict) -> pd.DataFrame:
     """Distribution stats for neural conviction scores."""
     conv_col = config["feature_builder"]["gate"]["neural_conviction_key"]
     db_cfg = config["database"]
+    const = config["reproducibility"]["constants"]
 
     if con is not None:
         return con.execute(

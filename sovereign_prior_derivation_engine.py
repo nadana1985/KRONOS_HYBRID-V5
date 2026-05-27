@@ -116,20 +116,17 @@ def _calculate_mutual_information(
     p_x = np.sum(p_xy, axis=const["one_int"])
     p_y = np.sum(p_xy, axis=const["zero_int"])
     
-    mi = const["zero_float"]
+    px_py = np.outer(p_x, p_y)
     epsilon_val = const["epsilon"]
     
-    for i in range(bins):
-        p_xi = p_x[i]
-        if p_xi > epsilon_val:
-            for j in range(bins):
-                p_yj = p_y[j]
-                p_xiyj = p_xy[i, j]
-                if p_yj > epsilon_val and p_xiyj > epsilon_val:
-                    denom = p_xi * p_yj
-                    if denom > epsilon_val:
-                        mi += float(p_xiyj * np.log(p_xiyj / denom))
-    return mi
+    # Create mask where both joint and marginal probabilities are above epsilon
+    valid = (p_xy > epsilon_val) & (px_py > epsilon_val)
+    
+    if not np.any(valid):
+        return const["zero_float"]
+        
+    mi_val = np.sum(p_xy[valid] * np.log(p_xy[valid] / px_py[valid]))
+    return float(mi_val)
 
 
 def _detect_volatility_changepoint(
@@ -213,10 +210,7 @@ def _derive_optimal_cycle_ratios(
     algo_cfg = sd_cfg.get("algorithm_params", {})
     
     # ── 1. ESTIMATE TREND RATIO VIA MUTUAL INFORMATION ───────────────────────
-    # Target: forward returns over 1x dominant cycle (causally shifted)
-    y_raw = log_ret.rolling(dominant_cycle, min_periods=dominant_cycle).sum().shift(-dominant_cycle)
-    # Align and trim to causal boundary: shift target backward so we evaluate past completed returns
-    y = y_raw.shift(dominant_cycle).dropna().to_numpy(dtype=float)
+    y = log_ret.rolling(dominant_cycle, min_periods=dominant_cycle).sum().shift(dominant_cycle).dropna().to_numpy(dtype=float)
     
     mi_bins = int(algo_cfg.get("mi_bins", const["ten_int"] + const["two_int"])) # SOVEREIGN_MATH_CONSTANT: default bins = 12
     grid_size = int(algo_cfg.get("mi_grid_size", const["ten_int"] + const["one_int"])) # SOVEREIGN_MATH_CONSTANT: default grid = 11
@@ -699,7 +693,7 @@ def _derive_dominant_cycle(
         dominant_cycle = int(np.clip(round(dominant_cycle_f), min_cycle, max_cycle))
 
         _LOGGER.info(
-            "CWT dominant cycle derived: scale=%.1f → period=%.1f → clipped=%d bars.",
+            "CWT dominant cycle derived: scale=%.1f -> period=%.1f -> clipped=%d bars.",
             best_scale, dominant_cycle_f, dominant_cycle,
         )
         return dominant_cycle, "cwt_ricker_numpy"
@@ -1645,9 +1639,8 @@ def _derive_adaptive_slot15_weights(
         if slot_key in structural_df.columns:
             shifted_data[slot_key] = structural_df[slot_key].shift(horizon)
             
-    # Add target forward returns (y) shifted causally by horizon
-    y_raw = log_ret.rolling(horizon, min_periods=horizon).sum().shift(-horizon)
-    shifted_data['target_return'] = y_raw.shift(horizon)
+    # Add target returns (y) causally
+    shifted_data['target_return'] = log_ret.rolling(horizon, min_periods=horizon).sum()
     
     # Drop rows where ANY column is NaN → perfect alignment preserved
     clean_data = shifted_data.dropna()
@@ -1795,6 +1788,25 @@ def _derive_slot15_composite(
     zero_f = const["zero_float"]
     static_weights = config["feature_builder"]["structural"]["slot_15"]["weights"]
     
+    if not enable_adaptive:
+        priors["slot_15_weights"] = static_weights
+        audit["slot_15_weights"] = {
+            "value": static_weights,
+            "method": "sovereign_config_adaptive_disabled",
+            "enable_adaptive_weights_active": False
+        }
+        slot_15_cfg = config["feature_builder"]["structural"]["slot_15"]
+        audit["slot_15_per_slot_normalisation"] = {
+            "value": slot_15_cfg.get("per_slot_normalisation", {}),
+            "method": "sovereign_config",
+            "sovereign_rationale": (
+                "Normalisation bounds are chosen to keep each slot in a well-conditioned "
+                "range that matches the downstream neural gate's input distribution. "
+                "Changing them requires full pipeline retraining."
+            ),
+        }
+        return
+        
     try:
         # Eagerly compute both to prevent deferral bias and provide detailed comparison log
         dyn_weights, weights_audit = _derive_adaptive_slot15_weights(
