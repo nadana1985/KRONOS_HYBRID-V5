@@ -392,7 +392,11 @@ def bar_index_range(
         range: Index range for the loop iterator.
     """
     warmup = config["data"]["warmup_bars"] if skip_warmup else config["reproducibility"]["constants"]["zero_int"]
-    return range(warmup, len(shard_candles))
+    forward_bars = config["miner"]["forward_bars"]
+    max_idx = len(shard_candles) - forward_bars
+    if max_idx < warmup:
+        max_idx = warmup
+    return range(warmup, max_idx)
 
 
 def compute_forward_metrics(
