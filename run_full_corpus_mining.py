@@ -119,7 +119,14 @@ def _run_shard(shard_start: str, shard_end: str, base_config: dict, bic_cache: O
                 _sov_deriv.patch_config_with_priors(config, sovereign_priors)
                 dc = _audit.get("_dominant_cycle", "N/A")
                 dc_method = _audit.get("_dominant_cycle_method", "N/A")
-                print(f"[SOVEREIGN] Derived dominant cycle: {dc} bars ({dc_method}) for {symbol}")
+                rv_med = _audit.get("_rv_median", 0.0)
+                rv_iqr = _audit.get("_rv_iqr", 0.0)
+                print(
+                    f"[SOVEREIGN] {symbol} | Shard {shard_start}–{shard_end} | "
+                    f"dominant_cycle={dc} bars ({dc_method}) | "
+                    f"rv_median={rv_med:.6f} rv_iqr={rv_iqr:.6f} | "
+                    f"n_causal_bars={_audit.get('_n_causal_bars', 0):,}"
+                )
                 
                 # Write sovereign audit logs if configured
                 if sd_cfg.get("store_audit", False):
@@ -188,7 +195,10 @@ def _mine_shard_only(config: dict) -> None:
             bar_indices = list(miner_engine.bar_index_range(shard_candles, config, skip_warmup=is_first_shard))
             total_bars = len(bar_indices)
 
-            print(f"  -> Mining {total_bars} bars for {symbol}...", flush=True)
+            start_time = time.time()
+            last_print_time = start_time
+
+            print(f"  -> Starting walk-forward loop on {total_bars} bars for {symbol}...", flush=True)
 
             for step_idx, current_idx in enumerate(bar_indices, 1):
                 # Hardened resource guard check per 100 steps
@@ -219,10 +229,27 @@ def _mine_shard_only(config: dict) -> None:
                     recent_convictions, dna_row, config
                 )
 
+                # Periodic step logging for background task log visibility
+                current_time = time.time()
+                if step_idx % const["hundred_int"] == const["zero_int"] or step_idx == const["one_int"] or step_idx == total_bars or (current_time - last_print_time) > float(const["thirty_int"]):
+                    elapsed = current_time - start_time
+                    latency_per_bar = elapsed / step_idx
+                    pct = (step_idx / total_bars) * float(const["hundred_int"])
+                    mined = len(shard_detected)
+                    print(
+                        f"[PROGRESS] {symbol} | Bar {step_idx}/{total_bars} ({pct:.2f}%) | "
+                        f"Mined: {mined} | Elapsed: {elapsed:.1f}s | "
+                        f"Speed: {latency_per_bar:.4f}s/bar | "
+                        f"Candle: {shard_candles['datetime'].iloc[current_idx]}",
+                        flush=True
+                    )
+                    last_print_time = current_time
+
             # Store signatures batch at the end of the shard
             mined_count = len(shard_detected)
             total_eval = len(shard_candles)
-            print(f"  -> [SHARD MINED] Signatures extracted: {mined_count} / {total_eval}", flush=True)
+            discarded = total_eval - mined_count
+            print(f"  -> [SHARD STATS] Bars Evaluated: {total_eval:,} | Signatures Mined: {mined_count:,} | Discarded: {discarded:,} ({discarded/total_eval:.2%})", flush=True)
             if shard_detected:
                 database_engine.store_signatures_batch(shard_detected, config)
 
