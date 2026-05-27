@@ -81,13 +81,12 @@ _HMM_BIC_GRID_LOW: int = 2      # lowest regime count evaluated in BIC grid
 _HMM_BIC_GRID_HIGH: int = 9     # one-past-last in grid (range endpoint), i.e. 2…8
 
 # ─────────────────────────────────────────────────────────────────────────────
-# BIC THROTTLE CACHE  (module-level — survives across shard calls)
+# BIC THROTTLE CACHE
 # ─────────────────────────────────────────────────────────────────────────────
 # BIC regime selection is O(n × K × iter) — expensive if called on every shard.
 # We cache the last result and only rerun when n_causal_bars has grown by at
-# least bic_refit_interval_bars since the last run. The cache is keyed by the
-# config-specified symbol so multi-symbol runs stay isolated.
-_BIC_CACHE: Dict[str, Dict] = {}
+# least bic_refit_interval_bars since the last run. The cache is passed in
+# explicitly by the orchestrator per symbol to guarantee strict process isolation.
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -317,6 +316,7 @@ def derive_sovereign_priors(
     config: Dict,
     precomputed_structural_df: Optional[pd.DataFrame] = None,
     previous_weights: Optional[Dict[str, float]] = None,
+    bic_cache: Optional[Dict] = None,
 ) -> Dict:
     """
     Derive all 47 KRONOS priors empirically from causal OHLCV data.
@@ -362,6 +362,9 @@ def derive_sovereign_priors(
                 "_derivation_timestamp": pd.Timestamp.utcnow().isoformat(),
             }
         }
+
+    if bic_cache is None:
+        bic_cache = {}  # Strict per-call isolated caching fallback
 
     const = config["reproducibility"]["constants"]
     global _MIN_BARS_FOR_CWT, _MIN_BARS_FOR_BIC, _MIN_BARS_FOR_ACF, _MATH_HALF
@@ -414,7 +417,7 @@ def derive_sovereign_priors(
     _derive_slot5_autocorr(priors, audit, dominant_cycle, log_ret, const, config)
     _derive_slot6_ema_ribbon(priors, audit, dominant_cycle, log_ret, const, config)
     _derive_slot7_vol_price_div(priors, audit, dominant_cycle, const, config)
-    _derive_slot8_hmm(priors, audit, dominant_cycle, log_ret, rv_series, n_bars, const, config)
+    _derive_slot8_hmm(priors, audit, dominant_cycle, log_ret, rv_series, n_bars, const, config, bic_cache=bic_cache)
     _derive_slot9_liquidity(priors, audit, causal_df, const, config)
     _derive_slot10_wick(priors, audit, causal_df, dominant_cycle, const, config)
     _derive_slot11_sr_kde(priors, audit, dominant_cycle, const, config)
@@ -626,17 +629,27 @@ def _derive_dominant_cycle(
         return fallback_cycle, "fallback_config"
 
     try:
-        arr = log_ret.to_numpy(dtype=float, copy=True)
+        sd_cfg = config.get("sovereign_derivation", {})
+        algo_cfg = sd_cfg.get("algorithm_params", {})
+
+        # Resolve dynamic lookback ceiling using adaptive dominant cycle sizing
+        prev_dc_val = config["feature_builder"]["structural"]["slot_8"].get("lookback_bars", fallback_cycle)
+        prev_dc = int(prev_dc_val) if prev_dc_val is not None else fallback_cycle
+
+        # CWT with dynamic capping
+        max_bars = int(algo_cfg.get("max_computation_bars", 2000))
+        adaptive_cap = max(512, prev_dc * int(algo_cfg.get("cwt_adaptive_multiplier", 8)))
+        effective_bars = min(max_bars, adaptive_cap, len(log_ret))
+        arr = log_ret.iloc[-effective_bars:].to_numpy(dtype=float, copy=True)
         arr = np.where(np.isfinite(arr), arr, const["zero_float"])
+        n = len(arr)
 
         # Build scale range spanning meaningful market cycles
         max_scale = min(n // _MATH_TWO, max_cycle)
         min_scale = max(_MATH_TWO, min_cycle // _MATH_TWO)
 
         # Subsample scales logarithmically to keep cost O(n * n_scales) manageable
-        sd_cfg = config.get("sovereign_derivation", {})
-        algo_cfg = sd_cfg.get("algorithm_params", {})
-        cwt_max_steps = int(algo_cfg.get("cwt_max_scale_steps", const.get("min_bars_for_bic", 128)))
+        cwt_max_steps = int(algo_cfg.get("cwt_max_scale_steps", const.get("min_bars_for_bic", 64)))
         n_scale_steps = min(cwt_max_steps, max_scale - min_scale + _MATH_ONE)
         scales = np.unique(
             np.round(np.geomspace(min_scale, max_scale, n_scale_steps)).astype(int)
@@ -651,6 +664,8 @@ def _derive_dominant_cycle(
         # σ = scale; kernel truncated at ±5σ for computational efficiency.
         power_spectrum = np.zeros(len(scales), dtype=float)
 
+        use_fft = bool(algo_cfg.get("cwt_use_fft", True))
+
         for i, scale in enumerate(scales):
             half_width = int(min(round(scale * 5), n // _MATH_TWO))
             t = np.arange(-half_width, half_width + _MATH_ONE, dtype=float)
@@ -661,7 +676,15 @@ def _derive_dominant_cycle(
             kernel_norm = np.linalg.norm(kernel)
             if kernel_norm > const["epsilon"]:
                 kernel /= kernel_norm
-            conv = np.convolve(arr, kernel, mode="same")
+            
+            if use_fft:
+                try:
+                    import scipy.signal as _sig
+                    conv = _sig.fftconvolve(arr, kernel, mode="same")
+                except Exception:
+                    conv = np.convolve(arr, kernel, mode="same")
+            else:
+                conv = np.convolve(arr, kernel, mode="same")
             power_spectrum[i] = float(np.mean(conv ** _MATH_TWO))
 
         best_scale_idx = int(np.argmax(power_spectrum))
@@ -1088,6 +1111,7 @@ def _derive_slot8_hmm(
     rv_series: pd.Series,
     n_causal_bars: int,
     const: Dict, config: Dict,
+    bic_cache: Optional[Dict] = None,
 ) -> None:
     """
     Slot 8 — HMM Regime Classifier:
@@ -1132,10 +1156,10 @@ def _derive_slot8_hmm(
         audit["slot_8_hmm_refit_interval"] = {"value": fallback_refit, "method": "fallback", "error": str(exc)}
 
     # num_regimes via throttled BIC minimisation
-    symbol_key = str(config["miner"]["symbols"][const["zero_int"]])
-    cache_entry = _BIC_CACHE.get(symbol_key, {})
-    last_bic_n = cache_entry.get("n_bars", const["zero_int"])
-    cached_regimes = cache_entry.get("num_regimes", None)
+    active_cache = bic_cache
+    last_bic_n = active_cache.get("n_bars", const["zero_int"])
+    cached_regimes = active_cache.get("num_regimes", None)
+    prev_model = active_cache.get("last_model", None)
 
     if cached_regimes is not None and (n_causal_bars - last_bic_n) < bic_interval:
         # Throttled: reuse cached result
@@ -1148,9 +1172,11 @@ def _derive_slot8_hmm(
         }
     else:
         # Run BIC search and update cache
-        best_n = _bic_regime_selection(log_ret, rv_series, fallback_niter, const, config)
+        best_n, best_model = _bic_regime_selection(log_ret, rv_series, fallback_niter, const, config, prev_model=prev_model)
         if best_n is not None:
-            _BIC_CACHE[symbol_key] = {"num_regimes": best_n, "n_bars": n_causal_bars}
+            active_cache["num_regimes"] = best_n
+            active_cache["n_bars"] = n_causal_bars
+            active_cache["last_model"] = best_model
             priors["slot_8_num_regimes"] = best_n
             audit["slot_8_num_regimes"] = {
                 "value": best_n,
@@ -1168,10 +1194,11 @@ def _bic_regime_selection(
     n_iter: int,
     const: Dict,
     config: Dict,
-) -> Optional[int]:
+    prev_model: Optional[object] = None,
+) -> Tuple[Optional[int], Optional[object]]:
     """BIC-minimised HMM regime count selection over grid [2…8]."""
     if len(log_ret) < _MIN_BARS_FOR_BIC:
-        return None
+        return None, None
 
     try:
         from hmmlearn.hmm import GaussianHMM
@@ -1188,11 +1215,12 @@ def _bic_regime_selection(
         features = features[mask]
 
         if len(features) < _MIN_BARS_FOR_BIC:
-            return None
+            return None, None
 
         best_bic = float("inf")
         ratio_cfg = config["sovereign_derivation"]["cycle_ratios"]
         best_n = int(ratio_cfg["hmm_bic_low"])
+        best_model = None
 
         for n_states in range(int(ratio_cfg["hmm_bic_low"]), int(ratio_cfg["hmm_bic_high"])):
             try:
@@ -1202,6 +1230,22 @@ def _bic_regime_selection(
                     n_iter=n_iter,
                     random_state=int(const["zero_int"]),
                 )
+                if prev_model is not None and hasattr(prev_model, "n_components") and prev_model.n_components == n_states:
+                    try:
+                        # Re-sort states by volatility covariance ascending to prevent label drift before warm-start copy
+                        prev_covars = prev_model.covars_
+                        state_vols = np.array([np.mean(np.diag(np.diag(prev_covars[s]))) for s in range(n_states)])
+                        sort_order = np.argsort(state_vols)
+
+                        m.n_features = prev_model.n_features
+                        m.startprob_ = np.copy(prev_model.startprob_[sort_order]).astype(float)
+                        m.transmat_ = np.copy(prev_model.transmat_[sort_order][:, sort_order]).astype(float)
+                        m.means_ = np.copy(prev_model.means_[sort_order]).astype(float)
+                        m.covars_ = np.copy(prev_covars[sort_order]).astype(float)
+                        m.init_params = ""  # SOVEREIGN_MATH_CONSTANT: warm-start HMM
+                    except Exception:
+                        m.init_params = "stmc"  # SOVEREIGN_MATH_CONSTANT: fallback
+
                 with warnings.catch_warnings():
                     warnings.simplefilter("ignore")
                     m.fit(features)
@@ -1216,18 +1260,19 @@ def _bic_regime_selection(
                 if bic < best_bic:
                     best_bic = bic
                     best_n = n_states
+                    best_model = m
 
             except Exception:
                 continue
 
-        return int(best_n)
+        return int(best_n), best_model
 
     except ImportError:
         _LOGGER.warning("hmmlearn not available — using config fallback for num_regimes.")
-        return None
+        return None, None
     except Exception as exc:
         _LOGGER.warning("BIC regime selection failed: %s", exc)
-        return None
+        return None, None
 
 
 def _derive_slot9_liquidity(
@@ -1529,6 +1574,17 @@ def _calculate_spearman_correlation(x: np.ndarray, y: np.ndarray, const: Dict) -
     return abs(corr)
 
 
+def _calculate_pearson_correlation(x: np.ndarray, y: np.ndarray, const: Dict) -> float:
+    """Computes Pearson Product-Moment Correlation in pure NumPy with zero literals."""
+    mask = np.isfinite(x) & np.isfinite(y)
+    x = x[mask]
+    y = y[mask]
+    if len(x) < const["five_int"]:
+        return const["zero_float"]
+    corr = float(np.corrcoef(x, y)[const["zero_int"], const["one_int"]])
+    return abs(corr) if np.isfinite(corr) else const["zero_float"]
+
+
 def _derive_adaptive_slot15_weights(
     causal_df: pd.DataFrame,
     dominant_cycle: int,
@@ -1549,14 +1605,14 @@ def _derive_adaptive_slot15_weights(
     min_bars = int(s15_cfg.get("min_history_bars", const["binance_limit_int"] * const["five_int"])) # Default 5000 bars
     
     if n < min_bars:
-        fallback_audit = {k: {"static": v, "dynamic_raw": v, "dynamic_smoothed": v, "delta": zero_f} for k, v in static_weights.items()}
+        fallback_audit = {k: {
+            "static": v, "dynamic_raw": v, "dynamic_smoothed": v, "delta": zero_f,
+            "raw_correlation": zero_f, "standard_error": zero_f, "confidence_floor": zero_f
+        } for k, v in static_weights.items()}
         return static_weights, fallback_audit
         
     close = causal_df["close"].astype(float)
     log_ret = np.log(close / close.shift(const["one_int"]) + epsilon).fillna(zero_f)
-    
-    y_raw = log_ret.rolling(dominant_cycle, min_periods=dominant_cycle).sum().shift(-dominant_cycle)
-    y = y_raw.shift(dominant_cycle).dropna().to_numpy(dtype=float)
     
     half_pt = n // const["two_int"]
     std_pre = float(np.std(log_ret.iloc[:half_pt]))
@@ -1576,58 +1632,93 @@ def _derive_adaptive_slot15_weights(
         
     metric_type = s15_cfg.get("relevance_metric", "spearman")
     fallback_metric = s15_cfg.get("relevance_metric_fallback", "spearman")
-    short_bars_cfg = int(s15_cfg.get("short_history_bars", const["binance_limit_int"] * const["two_int"])) # 2000 bars
     
+    # Configure horizon (shift) - default to dominant_cycle
+    horizon = int(s15_cfg.get("horizon_bars", dominant_cycle))
+    
+    # === UNIFIED CAUSAL ALIGNMENT (CRITICAL FIX) ===
+    # Build joint DataFrame to guarantee perfect temporal alignment
+    shifted_data = pd.DataFrame(index=causal_df.index)
+    
+    # Add all structural slots (x) shifted causally by horizon
+    for slot_key in static_weights.keys():
+        if slot_key in structural_df.columns:
+            shifted_data[slot_key] = structural_df[slot_key].shift(horizon)
+            
+    # Add target forward returns (y) shifted causally by horizon
+    y_raw = log_ret.rolling(horizon, min_periods=horizon).sum().shift(-horizon)
+    shifted_data['target_return'] = y_raw.shift(horizon)
+    
+    # Drop rows where ANY column is NaN → perfect alignment preserved
+    clean_data = shifted_data.dropna()
+    
+    # Guard: ensure we have a minimum sample length (e.g., 500 aligned bars)
+    min_aligned_bars = int(s15_cfg.get("min_aligned_bars", 500))  # SOVEREIGN_MATH_CONSTANT
+    if len(clean_data) < min_aligned_bars:
+        fallback_audit = {k: {
+            "static": v, "dynamic_raw": v, "dynamic_smoothed": v, "delta": zero_f,
+            "raw_correlation": zero_f, "standard_error": zero_f, "confidence_floor": zero_f
+        } for k, v in static_weights.items()}
+        return static_weights, fallback_audit
+        
     raw_relevance = {}
     
-    for slot_key in static_weights.keys():
-        if slot_key not in structural_df.columns:
-            raw_relevance[slot_key] = zero_f
-            continue
-            
-        x_raw = structural_df[slot_key].astype(float)
-        x = x_raw.shift(dominant_cycle).dropna().to_numpy(dtype=float)
-        
-        min_len = min(len(x), len(y))
-        if min_len > const["five_int"]:
-            long_slice_len = min(min_len, min_bars)
-            x_long = x[-long_slice_len:]
-            y_long = y[-long_slice_len:]
-            
-            short_slice_len = min(min_len, short_bars_cfg)
-            x_short = x[-short_slice_len:]
-            y_short = y[-short_slice_len:]
-            
-            # Helper to calculate relevance based on type
-            def compute_single_scale(x_s: np.ndarray, y_s: np.ndarray, slice_len: int) -> float:
-                try:
-                    if metric_type == "spearman":
-                        return _calculate_spearman_correlation(x_s, y_s, const)
-                    else:
-                        mi_bins = int(np.ceil(np.log2(slice_len) + one_f))
-                        mi_val = _calculate_mutual_information(x_s, y_s, mi_bins, const)
-                        if mi_val <= zero_f and fallback_metric == "spearman":
-                            return _calculate_spearman_correlation(x_s, y_s, const)
-                        return max(mi_val, zero_f)
-                except Exception:
-                    # Fallback to Spearman correlation if any math error happens
-                    return _calculate_spearman_correlation(x_s, y_s, const)
-                    
-            corr_long = compute_single_scale(x_long, y_long, long_slice_len)
-            corr_short = compute_single_scale(x_short, y_short, short_slice_len)
-            
-            short_wt = float(s15_cfg.get("blend_short_weight", float(const["half_float"])))
-            raw_relevance[slot_key] = short_wt * corr_short + (one_f - short_wt) * corr_long
-        else:
-            raw_relevance[slot_key] = zero_f
-            
-    relevance_values = sorted(raw_relevance.values(), reverse=True)
-    top_3_mean = float(np.mean(relevance_values[:const["three_int"]]))
+    # Extract aligned arrays sizes
+    short_bars_cfg = int(s15_cfg.get("short_history_bars", const["binance_limit_int"] * const["two_int"])) # 2000 bars
     
-    short_n_float = float(min(len(y), short_bars_cfg))
+    min_len = len(clean_data)
+    long_slice_len = min(min_len, min_bars)
+    short_slice_len = min(min_len, short_bars_cfg)
+    
+    # Pre-compute global statistical thresholds for Slot-15 weights confidence shrinkage
+    short_n_float = float(short_slice_len)
     stderr = one_f / (np.sqrt(short_n_float - one_f) + epsilon)
     floor_multiplier = float(s15_cfg.get("confidence_floor_multiplier", float(const["seven_int"])))
     conf_floor = floor_multiplier * stderr
+    
+    for slot_key in static_weights.keys():
+        if slot_key not in clean_data.columns:
+            raw_relevance[slot_key] = zero_f
+            continue
+            
+        x_aligned = clean_data[slot_key].to_numpy(dtype=float)
+        y_aligned = clean_data['target_return'].to_numpy(dtype=float)
+        
+        x_long = x_aligned[-long_slice_len:]
+        y_long = y_aligned[-long_slice_len:]
+        
+        x_short = x_aligned[-short_slice_len:]
+        y_short = y_aligned[-short_slice_len:]
+        
+        # Helper to calculate relevance based on type
+        def compute_single_scale(x_s: np.ndarray, y_s: np.ndarray, slice_len: int) -> float:
+            try:
+                if metric_type == "spearman":
+                    return _calculate_spearman_correlation(x_s, y_s, const)
+                elif metric_type == "pearson":
+                    return _calculate_pearson_correlation(x_s, y_s, const)
+                else:
+                    mi_bins = int(np.ceil(np.log2(slice_len) + one_f))
+                    mi_val = _calculate_mutual_information(x_s, y_s, mi_bins, const)
+                    if mi_val <= zero_f and fallback_metric == "spearman":
+                        return _calculate_spearman_correlation(x_s, y_s, const)
+                    elif mi_val <= zero_f and fallback_metric == "pearson":
+                        return _calculate_pearson_correlation(x_s, y_s, const)
+                    return max(mi_val, zero_f)
+            except Exception:
+                # Fallback to Spearman correlation if any math error happens
+                if fallback_metric == "pearson":
+                    return _calculate_pearson_correlation(x_s, y_s, const)
+                return _calculate_spearman_correlation(x_s, y_s, const)
+                
+        corr_long = compute_single_scale(x_long, y_long, long_slice_len)
+        corr_short = compute_single_scale(x_short, y_short, short_slice_len)
+        
+        short_wt = float(s15_cfg.get("blend_short_weight", float(const["half_float"])))
+        raw_relevance[slot_key] = short_wt * corr_short + (one_f - short_wt) * corr_long
+        
+    relevance_values = sorted(raw_relevance.values(), reverse=True)
+    top_3_mean = float(np.mean(relevance_values[:const["three_int"]]))
     
     confidence = min(one_f, top_3_mean / (conf_floor + epsilon))
     shrinkage_base = float(s15_cfg.get("shrinkage_base", float(const["half_float"])))
@@ -1666,8 +1757,21 @@ def _derive_adaptive_slot15_weights(
             "static": static_weights[key],
             "dynamic_raw": norm_relevance[key],
             "dynamic_smoothed": final_weights[key],
-            "delta": final_weights[key] - static_weights[key]
+            "delta": final_weights[key] - static_weights[key],
+            "raw_correlation": float(raw_relevance[key]),
+            "standard_error": float(stderr),
+            "confidence_floor": float(conf_floor)
         }
+        
+    # Store alignment metadata for precise diagnostics
+    weights_audit["_alignment_metadata"] = {
+        "aligned_sample_count": len(clean_data),
+        "alignment_dropped_bars": n - len(clean_data),
+        "horizon_bars": horizon,
+        "regime_stability": float(regime_stability),
+        "confidence_coefficient": float(confidence),
+        "shrinkage_beta": float(beta)
+    }
         
     return final_weights, weights_audit
 
@@ -1683,7 +1787,7 @@ def _derive_slot15_composite(
 ) -> None:
     """
     Slot 15 — Composite Weights:
-    Integrates dynamic Bayesian-shrinkage Spearman/MI adaptive slot weights.
+    Integrates dynamic Bayesian-shrinkage Spearman/Pearson/MI adaptive slot weights.
     """
     s15_cfg = config["sovereign_derivation"].get("slot_15", {})
     enable_adaptive = s15_cfg.get("enable_adaptive_weights", False)
@@ -1700,7 +1804,7 @@ def _derive_slot15_composite(
         if enable_adaptive:
             # Active prior weights allocation
             priors["slot_15_weights"] = dyn_weights
-            method_str = "adaptive_spearman_bayes_shrinkage" if s15_cfg.get("relevance_metric", "spearman") == "spearman" else "adaptive_mi_bayes_shrinkage"
+            method_str = "adaptive_weights_bayes_shrinkage"
         else:
             priors["slot_15_weights"] = static_weights
             method_str = "sovereign_config_adaptive_disabled"
@@ -1709,7 +1813,12 @@ def _derive_slot15_composite(
             "value": priors["slot_15_weights"],
             "method": method_str,
             "static_vs_dynamic_weights": weights_audit,
-            "enable_adaptive_weights_active": enable_adaptive
+            "enable_adaptive_weights_active": enable_adaptive,
+            "confidence_floor_multiplier": float(s15_cfg.get("confidence_floor_multiplier", float(const["seven_int"]))),
+            "shrinkage_base": float(s15_cfg.get("shrinkage_base", float(const["half_float"]))),
+            "relevance_metric": s15_cfg.get("relevance_metric", "spearman"),
+            "relevance_details": weights_audit,
+            "alignment_metadata": weights_audit.get("_alignment_metadata", {})
         }
     except Exception as exc:
         priors["slot_15_weights"] = static_weights

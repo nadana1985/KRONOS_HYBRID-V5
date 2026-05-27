@@ -378,7 +378,7 @@ sovereign_derivation:
   dynamic_fallback: true
   enable_dynamic_ratios: false   # Set to true in V6 — will override cycle_ratios with MI/changepoint optimization
   slot_15:
-    enable_adaptive_weights: false  # Toggle to true for adaptive weights activation
+    enable_adaptive_weights: false   # LOCKED - Static baseline wins
     min_history_bars: 5000         # Min bars for prior derivation significance
     short_history_bars: 2000       # Short-term window for multi-scale blend
     blend_short_weight: 0.5        # Blending weight for short-term vs long-term relevance
@@ -399,7 +399,10 @@ sovereign_derivation:
     gate_vol_clip_high: 95       # 95th percentile for vol-ratio upper clip
     acf_noise_significance: 95   # 95th percentile for ACF noise floor
   algorithm_params:
-    cwt_max_scale_steps: 128     # max scales in CWT geomspace sweep
+    cwt_max_scale_steps: 64
+    cwt_use_fft: true
+    max_computation_bars: 2000
+    cwt_adaptive_multiplier: 8   # new: dynamic scaling
     acf_noise_window: 200        # bars for noise-regime ACF estimation
     slot_5_min_sig_lags: 3       # minimum significant lags to accept
     slot_5_max_sig_lags: 8       # maximum significant lags cap
@@ -410,7 +413,6 @@ sovereign_derivation:
     changepoint_lookback_multiplier: 6 # lookback depth for regime changepoint search
     mi_significance_threshold: 0.02   # significance threshold from surrogate test
     ratio_smoothing_factor: 0.6       # EMA blend between static and dynamic values
-    max_computation_bars: 2000        # computational safety cap for long series
   cycle_ratios:
     slot_0_lookback: 12
     slot_0_absorption: 12

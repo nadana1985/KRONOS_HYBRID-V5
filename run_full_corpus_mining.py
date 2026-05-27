@@ -92,7 +92,7 @@ def check_resource_guardrails(config: dict) -> bool:
     return True
 
 
-def _run_shard(shard_start: str, shard_end: str, base_config: dict) -> None:
+def _run_shard(shard_start: str, shard_end: str, base_config: dict, bic_cache: Optional[dict] = None) -> None:
     """Runs the prior derivation and mining for a single chronological shard."""
     config = base_config.copy()
     config["data"] = base_config["data"].copy()
@@ -109,7 +109,9 @@ def _run_shard(shard_start: str, shard_end: str, base_config: dict) -> None:
     for symbol in config["miner"]["symbols"]:
         raw_candles, _ = data_engine.load_shard_data(symbol, config)
         if raw_candles is not None and len(raw_candles) > const["zero_int"]:
-            sovereign_priors = _sov_deriv.derive_sovereign_priors(raw_candles, config)
+            # Isolate cache per symbol to prevent concurrency side-effects
+            sym_cache = bic_cache.setdefault(symbol, {}) if bic_cache is not None else {}
+            sovereign_priors = _sov_deriv.derive_sovereign_priors(raw_candles, config, bic_cache=sym_cache)
             _audit = sovereign_priors.get("_audit", {})
 
             if not _audit.get("_disabled", False):
@@ -297,6 +299,7 @@ def main():
     checkpoint_interval = int(mining_cfg.get("checkpoint_interval_shards", 3))  # SOVEREIGN_MATH_CONSTANT
     processed_count = const["zero_int"]
     
+    local_bic_cache = {}  # SOVEREIGN_MATH_CONSTANT: thread-safe isolated HMM cache
     for idx, (shard_start, shard_end) in enumerate(shards, 1):
         shard_key = f"{shard_start}_{shard_end}".replace(" ", "_")
         expected_hash = compute_shard_hash(shard_start, shard_end, config_hash, raw_file_hash)
@@ -318,7 +321,7 @@ def main():
         print(f"\n[{idx}/{total_shards}] PROCESSING SHARD: {shard_start} to {shard_end}")
         
         try:
-            _run_shard(shard_start, shard_end, config)
+            _run_shard(shard_start, shard_end, config, bic_cache=local_bic_cache)
             
             # Save checkpoint atomically
             completed_checkpoints[shard_key] = expected_hash

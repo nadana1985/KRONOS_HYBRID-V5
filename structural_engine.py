@@ -557,6 +557,27 @@ def _slot_hmm_regime(
                     n_iter=n_iter,
                     random_state=const["zero_int"],
                 )
+                if cached_model is not None:
+                    try:
+                        if (hasattr(cached_model, "n_components") and 
+                            cached_model.n_components == n_states and 
+                            hasattr(cached_model, "means_") and 
+                            cached_model.means_.shape == (n_states, train_window.shape[1])):
+                            
+                            # Re-sort states by volatility covariance ascending to prevent label drift before warm-start copy
+                            prev_covars = cached_model.covars_
+                            state_vols = np.array([np.mean(np.diag(np.diag(prev_covars[s]))) for s in range(n_states)])
+                            sort_order = np.argsort(state_vols)
+                            
+                            m.n_features = int(cached_model.n_features)
+                            m.startprob_ = np.copy(cached_model.startprob_[sort_order]).astype(float)
+                            m.transmat_ = np.copy(cached_model.transmat_[sort_order][:, sort_order]).astype(float)
+                            m.means_ = np.copy(cached_model.means_[sort_order]).astype(float)
+                            m.covars_ = np.copy(prev_covars[sort_order]).astype(float)
+                            m.init_params = ""  # SOVEREIGN_MATH_CONSTANT: warm-start HMM
+                    except Exception:
+                        m.init_params = "stmc"  # SOVEREIGN_MATH_CONSTANT: standard fallback
+                
                 m.fit(train_window)
 
                 # FLAW 3 FIX: sort states by ascending mean volatility covariance.

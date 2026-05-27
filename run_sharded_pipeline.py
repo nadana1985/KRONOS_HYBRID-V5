@@ -15,6 +15,7 @@ import os
 import json
 import pandas as pd
 from pathlib import Path
+from typing import Optional
 from load_sovereign_config import load_sovereign_config
 import orchestrator_engine
 import miner_engine
@@ -44,7 +45,7 @@ def get_monthly_ranges(start_date_str: str, end_date_str: str):
     return ranges
 
 
-def _run_shard(shard_start: str, shard_end: str, base_config: dict) -> None:
+def _run_shard(shard_start: str, shard_end: str, base_config: dict, bic_cache: Optional[dict] = None) -> None:
     """
     Runs the mining-only portion of the pipeline for a single monthly shard.
     Deliberately does NOT trigger compile_global_ontology here — that runs
@@ -62,7 +63,6 @@ def _run_shard(shard_start: str, shard_end: str, base_config: dict) -> None:
     import data_engine
     import feature_builder_engine
     import sovereign_prior_derivation_engine as _sov_deriv
-
     config = load_sovereign_config("params_yaml.txt")
     config["data"]["fetch_start_date"] = shard_start
     config["data"]["fetch_end_date"] = shard_end
@@ -85,7 +85,11 @@ def _run_shard(shard_start: str, shard_end: str, base_config: dict) -> None:
             for symbol in config["miner"]["symbols"]:
                 raw_candles, _ = data_engine.load_shard_data(symbol, config)
                 if raw_candles is not None and len(raw_candles) > const["zero_int"]:
-                    sovereign_priors = _sov_deriv.derive_sovereign_priors(raw_candles, config)
+                    # Isolate cache per symbol to prevent concurrency side-effects
+                    sym_cache = bic_cache.setdefault(symbol, {}) if bic_cache is not None else {}
+                    sovereign_priors = _sov_deriv.derive_sovereign_priors(
+                        raw_candles, config, bic_cache=sym_cache
+                    )
                     _audit = sovereign_priors.get("_audit", {})
 
                     if not _audit.get("_disabled", False):
@@ -269,6 +273,8 @@ def main():
         except Exception:
             pass
 
+    symbol_bic_caches = {symbol: {} for symbol in base_config["miner"]["symbols"]}  # SOVEREIGN_MATH_CONSTANT
+
     # ── PHASE 1: MINE ALL SHARDS (slot_28 = 0.0 placeholder throughout) ──────
     for idx, (shard_start, shard_end) in enumerate(shards, 1):
         shard_key = f"{shard_start}_{shard_end}"
@@ -281,7 +287,7 @@ def main():
         print(f"=========================================")
 
         try:
-            _run_shard(shard_start, shard_end, base_config)
+            _run_shard(shard_start, shard_end, base_config, bic_cache=symbol_bic_caches)
 
             completed_shards.append(shard_key)
             with open(checkpoint_file, "w") as f:
