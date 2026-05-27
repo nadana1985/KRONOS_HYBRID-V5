@@ -92,7 +92,7 @@ def run_diagnostic():
             print(f"First passing bar index: {first_passing_idx}")
             
             recent_conv = feature_builder_engine.init_conviction_buffer(cfg)
-            conv, thresh, passed, emb = neural_integration_engine.compute_neural_gate(
+            conv, thresh, passed, emb, neural_avail = neural_integration_engine.compute_neural_gate(
                 slice_candles,
                 first_passing_idx,
                 recent_conv,

@@ -36,13 +36,13 @@ def parse_simple_yaml(filepath):
             # check if list item
             if stripped.startswith('-'):
                 val_str = stripped[1:].strip()
-                if any(c.isdigit() for c in val_str) and ('.' in val_str or 'e' in val_str):
-                    val = float(val_str)
-                else:
-                    try:
+                try:
+                    if any(c.isdigit() for c in val_str) and ('.' in val_str or 'e' in val_str):
+                        val = float(val_str)
+                    else:
                         val = int(val_str)
-                    except ValueError:
-                        val = val_str.strip('"').strip("'")
+                except ValueError:
+                    val = val_str.strip('"').strip("'")
                 
                 # Convert the stack[-1] from empty dict to list if needed
                 if isinstance(stack[-1], dict) and len(stack[-1]) == 0:
@@ -86,13 +86,13 @@ def parse_simple_yaml(filepath):
                         x_str = x.strip()
                         if not x_str:
                             continue
-                        if any(c.isdigit() for c in x_str) and '.' in x_str:
-                            items.append(float(x_str))
-                        else:
-                            try:
+                        try:
+                            if any(c.isdigit() for c in x_str) and '.' in x_str:
+                                items.append(float(x_str))
+                            else:
                                 items.append(int(x_str))
-                            except ValueError:
-                                items.append(x_str.strip('"').strip("'"))
+                        except ValueError:
+                            items.append(x_str.strip('"').strip("'"))
                     val = items
                 elif val_str.startswith('{') and val_str.endswith('}'):
                     # parse inline dictionary

@@ -1,0 +1,24 @@
+Core Project Documents (11)
+
+README.md
+KRONOS_V5_SOVEREIGN_ARCHITECTURE.md (or V4.5_Hybrid_Architecture.md)
+V5_SLOT_DEFINITIONS.md (or Hybrid_Slot_Definitions.md) — Most important
+V5_SOVEREIGN_METRICS.md
+DATA_LAYER_SPEC.md
+FEATURE_BUILDER_SPEC.md
+MINER_SPEC.md
+SIGNATURE_DATABASE_SPEC.md (new — very important for your goal)
+KRONOS_MINI_INTEGRATION.md (Hybrid only)
+VALIDATION_AND_EVALUATION.md
+CRITIQUE_AND_ROADMAP.md
+
+AI Coding Assistant Documents (Reusable / General — 8)
+
+AGENT_ARCHITECTURE_GUIDE.md ← Reusable
+HERMES_PROJECT_STRUCTURE.md ← Reusable
+ANTI_HALLUCINATION_GUIDE.md ← Reusable
+CLAUDE_STYLE_SYSTEM_PROMPT.md ← Reusable (or Grok/Cursor version)
+REPRODUCIBILITY_GUIDELINES.md ← Reusable
+IMPLEMENTATION_CHECKLIST.md ← Reusable
+SOVEREIGN_VALIDATOR.md (or Project_Integrity_Validator.md) ← Semi-reusable
+PIPELINE_WORKFLOW.md (RBI + Sovereign) ← Reusable
