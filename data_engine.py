@@ -272,7 +272,7 @@ def load_shard_data(symbol: str, config: Dict) -> Tuple[pd.DataFrame, pd.DataFra
         matching = candles[candles["datetime"] >= start_ts].index
         if len(matching) > 0:
             start_idx = max(0, matching[0] - warmup)
-            end_matching = candles[candles["datetime"] <= end_ts].index
+            end_matching = candles[candles["datetime"] < end_ts].index
             end_idx = end_matching[-1] + 1 if len(end_matching) > 0 else len(candles)
             
             candles = candles.iloc[start_idx:end_idx].reset_index(drop=True)
@@ -300,7 +300,7 @@ def load_shard_data_causal_only(symbol: str, config: Dict) -> Tuple[pd.DataFrame
         matching = candles[candles["datetime"] >= start_ts].index
         if len(matching) > 0:
             start_idx = matching[0]  # NO warmup subtraction
-            end_matching = candles[candles["datetime"] <= end_ts].index
+            end_matching = candles[candles["datetime"] < end_ts].index
             end_idx = end_matching[-1] + 1 if len(end_matching) > 0 else len(candles)
             candles = candles.iloc[start_idx:end_idx].reset_index(drop=True)
     agg = generate_synthetic_trades(candles, config)
